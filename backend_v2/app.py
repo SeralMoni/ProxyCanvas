@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import time
 import threading
@@ -30,6 +31,14 @@ import logging
 class NoServeImageLogs(logging.Filter):
     def filter(self, record):
         message = record.getMessage()
+        if " 200 " in message:
+            quiet_get_paths = (
+                'GET /api/jobs ',
+                'GET /api/jobs?',
+                'GET /api/jobs/',
+            )
+            if any(path in message for path in quiet_get_paths):
+                return False
         noisy_paths = (
             '/api/serve-image',
             '/api/thumbnail',
@@ -65,6 +74,9 @@ SCOPE_COLORS = {
     "CHATGPT2API": "\033[95m",
     "NANOBANANA2": "\033[92m",
     "CLIPROXY": "\033[96m",
+    "OPENAI": "\033[95m",
+    "SOUSAKU": "\033[93m",
+    "COMFYUI": "\033[92m",
     "GALLERY": "\033[95m",
     "URL": "\033[33m",
     "UPLOAD": "\033[33m",
@@ -247,8 +259,13 @@ def log_event(scope, message, level="INFO", icon=None, **fields):
 
     timestamp = time.strftime("%H:%M:%S")
     scope = scope.upper()
+    provider = fields.get("provider")
+    provider_name = str(provider or "").upper()
+    scope_display = f"JOB={provider_name}" if scope == "JOB" and provider_name else scope
+    if scope == "JOB" and provider_name:
+        fields.pop("provider", None)
     icon_text = icon or LEVEL_ICONS.get(level, "•")
-    scope_text = f"[{scope:<11}]"
+    scope_text = f"[{scope_display:<11}]"
     prompt = fields.pop("prompt", None)
     parts = []
     if prompt:
@@ -263,7 +280,18 @@ def log_event(scope, message, level="INFO", icon=None, **fields):
     if LOG_COLOR:
         icon_color = LOG_COLORS.get(level, "")
         scope_color = SCOPE_COLORS.get(scope, LOG_COLORS.get(level, ""))
-        prefix = f"{timestamp} {icon_color}{icon_text}{LOG_RESET} {scope_color}{scope_text}{LOG_RESET}"
+        provider_color = SCOPE_COLORS.get(provider_name, scope_color)
+        if scope == "JOB" and provider_name:
+            bracket_width = max(11, len(scope_display))
+            padding = " " * max(0, bracket_width - len(scope_display))
+            colored_scope = (
+                f"{scope_color}[JOB={LOG_RESET}"
+                f"{provider_color}{provider_name}{LOG_RESET}"
+                f"{scope_color}{padding}]{LOG_RESET}"
+            )
+            prefix = f"{timestamp} {icon_color}{icon_text}{LOG_RESET} {colored_scope}"
+        else:
+            prefix = f"{timestamp} {icon_color}{icon_text}{LOG_RESET} {scope_color}{scope_text}{LOG_RESET}"
     else:
         prefix = f"{timestamp} {icon_text} {scope_text}"
     line = f"{prefix} {message}"
@@ -1441,6 +1469,32 @@ def _generate_cliproxy_gemini_flash_image(prompt, ratio, resolution, quality, n,
         return jsonify({"success": False, "error": {"message": str(e)}}), 500
 
 
+def _resolve_cliproxy_openai_size(size, resolution=None):
+    """Convert UI aspect ratio values into pixel sizes accepted by /images/generations."""
+    raw = str(size or "").strip()
+    if re.fullmatch(r"\d+x\d+", raw):
+        return raw
+
+    ratio = raw.replace("：", ":")
+    resolution_key = str(resolution or "2K").upper()
+    mapping = {
+        "1:1": {"1K": "1024x1024", "2K": "2048x2048", "4K": "2880x2880"},
+        "3:2": {"1K": "1536x1024", "2K": "2048x1360", "4K": "3504x2336"},
+        "2:3": {"1K": "1024x1536", "2K": "1360x2048", "4K": "2336x3504"},
+        "4:3": {"1K": "1024x768", "2K": "2048x1536", "4K": "3264x2448"},
+        "3:4": {"1K": "768x1024", "2K": "1536x2048", "4K": "2448x3264"},
+        "5:4": {"1K": "1280x1024", "2K": "2560x2048", "4K": "3200x2560"},
+        "4:5": {"1K": "1024x1280", "2K": "2048x2560", "4K": "2560x3200"},
+        "16:9": {"1K": "1536x864", "2K": "2048x1152", "4K": "3840x2160"},
+        "9:16": {"1K": "864x1536", "2K": "1152x2048", "4K": "2160x3840"},
+        "2:1": {"1K": "2048x1024", "2K": "2688x1344", "4K": "3840x1920"},
+        "1:2": {"1K": "1024x2048", "2K": "1344x2688", "4K": "1920x3840"},
+        "21:9": {"1K": "2016x864", "2K": "2688x1152", "4K": "3840x1648"},
+        "9:21": {"1K": "864x2016", "2K": "1152x2688", "4K": "1648x3840"},
+    }
+    return mapping.get(ratio, {}).get(resolution_key) or mapping.get(ratio, {}).get("2K") or "2048x1152"
+
+
 @app.route('/api/generate-cliproxy', methods=['POST'])
 def generate_image_cliproxy():
     """Generate image using CLIProxyAPI local proxy (OpenAI-compatible, gpt-image-2)"""
@@ -1472,6 +1526,8 @@ def generate_image_cliproxy():
                 feather=feather,
                 job_data=data,
             )
+
+        size = _resolve_cliproxy_openai_size(size, data.get("resolution"))
 
         # Ensure save directory exists
         os.makedirs(CLIPROXY_SAVE_DIR, exist_ok=True)

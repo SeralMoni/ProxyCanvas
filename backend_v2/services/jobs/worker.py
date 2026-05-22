@@ -10,6 +10,18 @@ from services.jobs.providers import ProviderAdapter, ProviderTimeout, SousakuAda
 from services.jobs.store import JobStore
 
 
+def _requested_image_count(job: dict[str, Any]) -> int:
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    for key in ("n", "number", "imageCount"):
+        try:
+            value = int(params.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 1
+
+
 class JobWorker:
     def __init__(
         self,
@@ -81,8 +93,10 @@ class JobWorker:
             self._log("JOB", "开始执行", "INFO", job=job_id[:12], provider=provider)
             result = adapter.run(job, self.store)
             self.store.finish_job(job_id, "succeeded", result=result)
-            self.store.add_event(job_id, "info", "任务成功", {"images": len(result)})
-            self._log("JOB", "任务完成", "OK", job=job_id[:12], provider=provider, images=len(result))
+            requested = _requested_image_count(job)
+            succeeded = len(result)
+            self.store.add_event(job_id, "info", "任务成功", {"images": succeeded, "requested": requested})
+            self._log("JOB", "任务完成", "OK", job=job_id[:12], provider=provider, images=f"{succeeded}/{requested}")
         except ProviderTimeout as exc:
             self.store.finish_job(job_id, "timeout", error=str(exc))
             self.store.add_event(job_id, "error", "任务超时", {"error": str(exc)})
