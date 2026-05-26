@@ -1,10 +1,14 @@
 import {
     Activity,
     Check,
+    ChevronDown,
     Database,
+    Trash2,
     FolderOpen,
     HardDrive,
+    Lock,
     Loader2,
+    Plus,
     Plug,
     RotateCw,
     Settings2,
@@ -17,8 +21,17 @@ import type { ComponentType, ReactNode } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NavLink, useNavigate, useParams } from 'react-router-dom';
 import { HexColorPicker } from 'react-colorful';
-import { loadBackendSettings, loadRuntimeProviders, saveBackendSettings, saveRuntimeProvider } from '../../services/api';
-import type { BackendSettings, RuntimeProvider, SettingValue } from '../../services/api';
+import {
+    clearStorageCache,
+    createRuntimeProvider,
+    deleteRuntimeProvider,
+    loadBackendSettings,
+    loadRuntimeProviders,
+    loadStorageUsage,
+    saveBackendSettings,
+    saveRuntimeProvider,
+} from '../../services/api';
+import type { BackendSettings, RuntimeProvider, SettingValue, StorageUsage } from '../../services/api';
 import {
     DEFAULT_GALLERY_SELECTION_BOX_COLOR,
     DEFAULT_GALLERY_SELECTION_COLOR,
@@ -61,9 +74,101 @@ const DISPLAY_MODE_OPTIONS: Array<{ value: GalleryDisplayMode; label: string }> 
 const ACCENT_COLOR_PRESETS = ['#ff8a00', '#ffb703', '#e76f51', '#2a9d8f', '#8ecae6', '#cdb4db'];
 const SELECTION_BOX_COLOR_PRESETS = ['#fff3b0', '#ffd6a5', '#ffc2b4', '#b7e4c7', '#bde0fe', '#e0bbe4'];
 const TAG_COLOR_PRESETS = ['#f43f5e', '#f97316', '#10b981', '#06b6d4', '#6366f1', '#d946ef'];
+const CUSTOM_PROVIDER_BADGE_COLOR = '#8ecae6';
+const OPENAI_PROTOCOL_OPTIONS = [
+    { value: 'images', label: 'Images API' },
+    { value: 'chat-completions', label: 'Chat Completions' },
+    { value: 'responses', label: 'Responses' },
+];
+
+type ModelExposureKey = 'ratio' | 'resolution' | 'quality' | 'imageCount';
+
+type ExposureOption = string | number | boolean | { value: string | number | boolean; label?: string };
+
+type ExposureFieldDraft = {
+    enabled: boolean;
+    key: ModelExposureKey;
+    label: string;
+    requestField: string;
+    type: 'select' | 'boolean';
+    optionsText: string;
+    defaultValue: string;
+};
+
+type ModelDraft = {
+    label: string;
+    controls: Record<ModelExposureKey, ExposureFieldDraft>;
+};
+
+type RuntimeModelControl = NonNullable<RuntimeProvider['models'][number]['controls']>[number];
+
+const EXPOSURE_ORDER: ModelExposureKey[] = ['ratio', 'resolution', 'quality', 'imageCount'];
+const EXPOSURE_REQUEST_FIELDS: Record<ModelExposureKey, string> = {
+    ratio: 'size',
+    resolution: 'resolution',
+    quality: 'quality',
+    imageCount: 'n',
+};
+const EXPOSURE_LABELS: Record<ModelExposureKey, string> = {
+    ratio: '比例 / 尺寸',
+    resolution: '分辨率',
+    quality: '质量',
+    imageCount: '数量',
+};
+const EXPOSURE_DEFAULTS: Record<ModelExposureKey, ExposureFieldDraft> = {
+    ratio: {
+        enabled: true,
+        key: 'ratio',
+        label: '比例 / 尺寸',
+        requestField: 'size',
+        type: 'select',
+        optionsText: '16:9; 9:16; 1:1; 4:3; 3:4; 1080x1920; 1920x1080',
+        defaultValue: '16:9',
+    },
+    resolution: {
+        enabled: true,
+        key: 'resolution',
+        label: '分辨率',
+        requestField: 'resolution',
+        type: 'select',
+        optionsText: '1K; 2K; 4K',
+        defaultValue: '2K',
+    },
+    quality: {
+        enabled: true,
+        key: 'quality',
+        label: '质量',
+        requestField: 'quality',
+        type: 'select',
+        optionsText: 'low|Low; medium|Medium; high|High',
+        defaultValue: 'high',
+    },
+    imageCount: {
+        enabled: true,
+        key: 'imageCount',
+        label: '数量',
+        requestField: 'n',
+        type: 'select',
+        optionsText: '1; 2; 3; 4',
+        defaultValue: '1',
+    },
+};
 
 function sourceText(source?: string) {
     return source || 'config.py';
+}
+
+function formatBytes(bytes?: number) {
+    const value = Math.max(0, Number(bytes || 0));
+    if (value < 1024) return `${value} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let size = value / 1024;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+    }
+    return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
 }
 
 function isHexColor(value: string) {
@@ -153,6 +258,22 @@ function Toggle({
     );
 }
 
+function FieldLabel({ children, locked = false }: { children: ReactNode; locked?: boolean }) {
+    return (
+        <span className="mb-2 flex items-center gap-1.5 text-xs text-[var(--text-muted)]">
+            {children}
+            {locked && <Lock className="h-3.5 w-3.5 text-[var(--text-muted)]" aria-label="锁定" />}
+        </span>
+    );
+}
+
+function fieldClassName(locked = false, extra = '') {
+    const stateClass = locked
+        ? 'cursor-not-allowed border-dashed text-[var(--text-muted)]'
+        : 'text-[var(--text-primary)] focus:border-[var(--accent-primary)]';
+    return `w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm outline-none ${stateClass} ${extra}`;
+}
+
 function ColorPreference({
     label,
     value,
@@ -190,8 +311,15 @@ function ColorPreference({
 
     return (
         <div className="relative" ref={pickerRef}>
-            <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="mb-2 flex items-center gap-2">
                 <span className="text-xs text-[var(--text-muted)]">{label}</span>
+                <button
+                    type="button"
+                    onClick={() => setPickerOpen((open) => !open)}
+                    className="h-6 w-6 rounded-md border border-white/10 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.18)] transition-transform hover:scale-105"
+                    style={{ backgroundColor: colorInputValue }}
+                    aria-label={`自定义${label}`}
+                />
                 <button
                     type="button"
                     onClick={() => onChange(defaultValue)}
@@ -201,13 +329,6 @@ function ColorPreference({
                 </button>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-                <button
-                    type="button"
-                    onClick={() => setPickerOpen((open) => !open)}
-                    className="h-8 w-8 rounded-md border border-white/10 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.18)] transition-transform hover:scale-105"
-                    style={{ backgroundColor: colorInputValue }}
-                    aria-label={`自定义${label}`}
-                />
                 <input
                     value={value}
                     onChange={(event) => onChange(event.target.value)}
@@ -215,7 +336,7 @@ function ColorPreference({
                 />
             </div>
             {pickerOpen && (
-                <div className="absolute left-0 top-[4.3rem] z-[90] w-64 rounded-xl border border-[var(--border-subtle)] bg-[rgba(24,24,27,0.98)] p-3 shadow-[0_18px_48px_rgba(0,0,0,0.42)] backdrop-blur-xl">
+                <div className="absolute left-0 top-[3.7rem] z-[90] w-64 rounded-xl border border-[var(--border-subtle)] bg-[rgba(24,24,27,0.98)] p-3 shadow-[0_18px_48px_rgba(0,0,0,0.42)] backdrop-blur-xl">
                     <div className="mb-3 flex items-center justify-between gap-3">
                         <span className="text-xs font-medium text-[var(--text-secondary)]">自定义颜色</span>
                         <span className="h-5 w-5 rounded border border-white/10" style={{ backgroundColor: colorInputValue }} />
@@ -234,6 +355,138 @@ function ColorPreference({
                         >
                             完成
                         </button>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function ModelExposureEditor({
+    modelId,
+    draft,
+    onChange,
+    onRemove,
+}: {
+    modelId: string;
+    draft: ModelDraft;
+    onChange: (next: ModelDraft) => void;
+    onRemove: () => void;
+}) {
+    const [open, setOpen] = useState(false);
+    const updateControl = useCallback((key: ModelExposureKey, patch: Partial<ExposureFieldDraft>) => {
+        onChange({
+            ...draft,
+            controls: {
+                ...draft.controls,
+                [key]: {
+                    ...draft.controls[key],
+                    ...patch,
+                },
+            },
+        });
+    }, [draft, onChange]);
+
+    return (
+        <div className="overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-secondary)]">
+            <div className="flex min-h-14 items-center gap-2 px-3 py-2">
+                <button
+                    type="button"
+                    onClick={() => setOpen((value) => !value)}
+                    className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-[var(--bg-card-hover)]"
+                    aria-expanded={open}
+                >
+                    <ChevronDown className={`h-4 w-4 shrink-0 text-[var(--text-muted)] transition-transform ${open ? '' : '-rotate-90'}`} />
+                    <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium text-[var(--text-primary)]">{draft.label || modelId}</span>
+                        <span className="block truncate font-mono text-xs text-[var(--text-muted)]">{modelId}</span>
+                    </span>
+                </button>
+                <button
+                    type="button"
+                    onClick={onRemove}
+                    className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg border border-[var(--border-subtle)] px-2.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-red-400/50 hover:bg-red-500/10 hover:text-red-200"
+                >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    移除
+                </button>
+            </div>
+
+            {open && (
+                <div className="border-t border-[var(--border-subtle)] p-4">
+                    <label className="mb-4 block">
+                        <span className="mb-1 block text-xs text-[var(--text-muted)]">模型显示名</span>
+                        <input
+                            value={draft.label}
+                            onChange={(event) => onChange({ ...draft, label: event.target.value })}
+                            placeholder={modelId}
+                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-card)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                        />
+                    </label>
+
+                    <div className="overflow-hidden rounded-lg border border-[var(--border-subtle)]">
+                        {EXPOSURE_ORDER.map((key) => {
+                            const control = draft.controls[key];
+                            const isSelect = control.type === 'select';
+                            return (
+                                <div
+                                    key={key}
+                                    className="grid gap-3 border-b border-[var(--border-subtle)] bg-[var(--bg-card)] p-3 last:border-b-0 xl:grid-cols-[8rem_minmax(0,1fr)_8rem_8rem] xl:items-end"
+                                >
+                                    <label className="flex min-h-9 items-center gap-2 text-sm text-[var(--text-primary)]">
+                                        <input
+                                            type="checkbox"
+                                            checked={control.enabled}
+                                            onChange={(event) => updateControl(key, { enabled: event.target.checked })}
+                                            className="h-4 w-4 accent-[var(--accent-primary)]"
+                                        />
+                                        <span>{EXPOSURE_LABELS[key]}</span>
+                                    </label>
+                                    {isSelect ? (
+                                        <>
+                                            <label className="block">
+                                                <span className="mb-1 block text-xs text-[var(--text-muted)]">候选值</span>
+                                                <input
+                                                    value={control.optionsText}
+                                                    onChange={(event) => updateControl(key, { optionsText: event.target.value })}
+                                                    disabled={!control.enabled}
+                                                    placeholder="high; medium; low"
+                                                    className="w-full rounded-md border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-2.5 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)] disabled:opacity-45"
+                                                />
+                                            </label>
+                                            <label className="block">
+                                                <span className="mb-1 block text-xs text-[var(--text-muted)]">默认</span>
+                                                <input
+                                                    value={control.defaultValue}
+                                                    onChange={(event) => updateControl(key, { defaultValue: event.target.value })}
+                                                    disabled={!control.enabled}
+                                                    className="w-full rounded-md border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-2.5 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)] disabled:opacity-45"
+                                                />
+                                            </label>
+                                            <label className="block">
+                                                <span className="mb-1 block text-xs text-[var(--text-muted)]">字段</span>
+                                                <input
+                                                    value={control.requestField}
+                                                    onChange={(event) => updateControl(key, { requestField: event.target.value })}
+                                                    disabled={!control.enabled}
+                                                    placeholder={EXPOSURE_REQUEST_FIELDS[key]}
+                                                    className="w-full rounded-md border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-2.5 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)] disabled:opacity-45"
+                                                />
+                                            </label>
+                                        </>
+                                    ) : (
+                                        <div className="xl:col-span-3">
+                                            <div className="rounded-md border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-xs text-[var(--text-muted)]">
+                                                勾选后底部面板允许使用这个能力。
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                    <div className="mt-3 text-xs text-[var(--text-muted)]">
+                        候选值支持逗号、分号或换行；`value|显示名` 可以把发送值和界面显示分开。
                     </div>
                 </div>
             )}
@@ -324,6 +577,25 @@ function PreferencesPanel() {
     const setGallerySelectionBoxColor = useStore((s) => s.setGallerySelectionBoxColor);
     const galleryTagColor = useStore((s) => s.galleryTagColor);
     const setGalleryTagColor = useStore((s) => s.setGalleryTagColor);
+    const [galleryPageSizeDraft, setGalleryPageSizeDraft] = useState(String(galleryPageSize));
+
+    useEffect(() => {
+        setGalleryPageSizeDraft(String(galleryPageSize));
+    }, [galleryPageSize]);
+
+    const commitGalleryPageSize = useCallback(() => {
+        const trimmed = galleryPageSizeDraft.trim();
+        if (!trimmed) {
+            setGalleryPageSizeDraft(String(galleryPageSize));
+            return;
+        }
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed)) {
+            setGalleryPageSizeDraft(String(galleryPageSize));
+            return;
+        }
+        setGalleryPageSize(parsed);
+    }, [galleryPageSize, galleryPageSizeDraft, setGalleryPageSize]);
 
     const colorTargets = useMemo<ColorTarget[]>(() => [
         {
@@ -373,8 +645,18 @@ function PreferencesPanel() {
                                 min={MIN_GALLERY_PAGE_SIZE}
                                 max={MAX_GALLERY_PAGE_SIZE}
                                 step={10}
-                                value={galleryPageSize}
-                                onChange={(event) => setGalleryPageSize(Number(event.target.value))}
+                                value={galleryPageSizeDraft}
+                                onChange={(event) => setGalleryPageSizeDraft(event.target.value)}
+                                onBlur={commitGalleryPageSize}
+                                onKeyDown={(event) => {
+                                    if (event.key === 'Enter') {
+                                        event.currentTarget.blur();
+                                    }
+                                    if (event.key === 'Escape') {
+                                        setGalleryPageSizeDraft(String(galleryPageSize));
+                                        event.currentTarget.blur();
+                                    }
+                                }}
                                 className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
                             />
                             <span className="mt-1 block text-xs text-[var(--text-muted)]">
@@ -477,11 +759,16 @@ function ProviderPanel({
     activeProviderId?: string;
     onReload: () => Promise<void>;
 }) {
-    const activeProvider = providers.find((provider) => provider.id === activeProviderId) || providers[0];
+    const isCreatingCustom = activeProviderId === 'custom';
+    const activeProvider = isCreatingCustom
+        ? undefined
+        : providers.find((provider) => provider.id === activeProviderId) || providers[0];
     return (
         <div className="grid gap-4 xl:grid-cols-[16rem_1fr]">
             <Panel>
-                <div className="mb-3 text-sm font-semibold text-[var(--text-primary)]">Provider 列表</div>
+                <div className="mb-3 flex items-center justify-between gap-2">
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">Provider 列表</div>
+                </div>
                 <div className="space-y-1">
                     {providers.map((provider) => (
                         <NavLink
@@ -490,7 +777,7 @@ function ProviderPanel({
                             className={({ isActive }) =>
                                 [
                                     'block rounded-lg px-3 py-2 text-sm transition-colors',
-                                    isActive || activeProvider?.id === provider.id
+                                    isActive
                                         ? 'bg-[var(--accent-primary)]/18 text-[var(--text-primary)]'
                                         : 'text-[var(--text-secondary)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)]',
                                 ].join(' ')
@@ -500,41 +787,411 @@ function ProviderPanel({
                             <div className="mt-0.5 truncate text-xs text-[var(--text-muted)]">{provider.type}</div>
                         </NavLink>
                     ))}
+                    <NavLink
+                        to="/settings/providers/custom"
+                        className={({ isActive }) =>
+                            [
+                                'mt-3 flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-sm transition-colors',
+                                isActive || isCreatingCustom
+                                    ? 'border-[var(--accent-primary)]/50 bg-[var(--accent-primary)]/14 text-[var(--text-primary)]'
+                                    : 'border-[var(--border-subtle)] text-[var(--text-secondary)] hover:border-[var(--text-muted)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)]',
+                            ].join(' ')
+                        }
+                    >
+                        <Plus className="h-4 w-4" />
+                        <span className="font-medium">自定义 API</span>
+                    </NavLink>
                 </div>
             </Panel>
 
-            {activeProvider ? <ProviderDetails provider={activeProvider} onReload={onReload} /> : null}
+            {isCreatingCustom ? (
+                <CustomProviderForm onReload={onReload} />
+            ) : activeProvider ? (
+                <ProviderDetails provider={activeProvider} onReload={onReload} />
+            ) : null}
+        </div>
+    );
+}
+
+function slugFromProvider(label: string, baseUrl: string) {
+    const source = label.trim() || baseUrl.trim() || 'custom-api';
+    const withoutProtocol = source.replace(/^https?:\/\//i, '');
+    const slug = withoutProtocol.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    return slug || `custom-api-${Date.now().toString(36)}`;
+}
+
+function modelListFromText(text: string) {
+    return text
+        .split(/[;,\n]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
+function parseExposureOptions(text: string): ExposureOption[] {
+    return text
+        .split(/[;,\n]+/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((item) => {
+            const separatorIndex = item.indexOf('|');
+            if (separatorIndex > 0) {
+                const value = item.slice(0, separatorIndex).trim();
+                const label = item.slice(separatorIndex + 1).trim();
+                if (value) {
+                    return label ? { value, label } : value;
+                }
+            }
+            return item;
+        });
+}
+
+function exposureOptionsToText(options: ExposureOption[] | undefined) {
+    if (!Array.isArray(options)) return '';
+    return options
+        .map((option) => {
+            if (typeof option === 'object' && option) {
+                return option.label ? `${String(option.value)}|${option.label}` : String(option.value);
+            }
+            return String(option);
+        })
+        .join('; ');
+}
+
+function createExposureDraft(key: ModelExposureKey): ExposureFieldDraft {
+    const preset = EXPOSURE_DEFAULTS[key];
+    return { ...preset };
+}
+
+function createModelDraft(modelValue: string, model?: RuntimeProvider['models'][number]): ModelDraft {
+    const payload = model?.payload && typeof model.payload === 'object' ? model.payload : {};
+    const controlsByKey = new Map((model?.controls || []).map((control) => [String(control.key), control]));
+    const isExistingModel = Boolean(model);
+    const draft: ModelDraft = {
+        label: model?.label || modelValue,
+        controls: {
+            ratio: { ...createExposureDraft('ratio'), enabled: !isExistingModel },
+            resolution: { ...createExposureDraft('resolution'), enabled: !isExistingModel },
+            quality: { ...createExposureDraft('quality'), enabled: !isExistingModel },
+            imageCount: { ...createExposureDraft('imageCount'), enabled: !isExistingModel },
+        },
+    };
+
+    for (const key of EXPOSURE_ORDER) {
+        const control = controlsByKey.get(key);
+        if (control) {
+            const mappedField = Object.entries(payload).find(([, sourceKey]) => String(sourceKey) === key)?.[0];
+            draft.controls[key] = {
+                ...draft.controls[key],
+                enabled: true,
+                label: control.label || EXPOSURE_LABELS[key],
+                type: control.type === 'boolean' ? 'boolean' : 'select',
+                optionsText: exposureOptionsToText(control.options as ExposureOption[] | undefined) || draft.controls[key].optionsText,
+                defaultValue: String(model?.defaults?.[key] ?? draft.controls[key].defaultValue ?? ''),
+                requestField: key === 'imageCount' && mappedField === 'count'
+                    ? 'n'
+                    : mappedField || EXPOSURE_REQUEST_FIELDS[key],
+            };
+        }
+    }
+
+    return draft;
+}
+
+function buildModelConfig(modelValue: string, draft?: ModelDraft) {
+    const controls: RuntimeModelControl[] = [];
+    const defaults: Record<string, unknown> = {};
+    const features: Record<string, unknown> = { referenceImage: true, mask: false };
+    const payload: Record<string, unknown> = {};
+    const source = draft || createModelDraft(modelValue);
+
+    for (const key of EXPOSURE_ORDER) {
+        const control = source.controls[key];
+        if (!control?.enabled) continue;
+
+        const requestField = control.requestField.trim() || EXPOSURE_REQUEST_FIELDS[key];
+        const label = control.label.trim() || EXPOSURE_LABELS[key];
+        const nextControl: Record<string, unknown> = {
+            key,
+            label,
+            type: control.type,
+        };
+        if (control.type === 'select') {
+            nextControl.options = parseExposureOptions(control.optionsText);
+            if (control.defaultValue.trim()) {
+                defaults[key] = control.defaultValue.trim();
+            }
+        }
+        controls.push(nextControl as RuntimeModelControl);
+        if (requestField) {
+            payload[requestField] = key;
+        }
+    }
+
+    return {
+        value: modelValue,
+        label: source.label.trim() || modelValue,
+        defaults,
+        controls,
+        features,
+        payload,
+    };
+}
+
+function CustomProviderForm({ onReload }: { onReload: () => Promise<void> }) {
+    const navigate = useNavigate();
+    const [adding, setAdding] = useState(false);
+    const [provider, setProvider] = useState({
+        label: '',
+        protocol: 'images',
+        baseUrl: '',
+        apiKey: '',
+        badgeColor: CUSTOM_PROVIDER_BADGE_COLOR,
+        modelsText: 'gpt-image-2',
+        stream: false,
+    });
+    const [modelDrafts, setModelDrafts] = useState<Record<string, ModelDraft>>({});
+    const modelIds = useMemo(() => modelListFromText(provider.modelsText), [provider.modelsText]);
+
+    useEffect(() => {
+        setModelDrafts((current) => {
+            const next = { ...current };
+            let changed = false;
+            for (const modelId of modelIds) {
+                if (!next[modelId]) {
+                    next[modelId] = createModelDraft(modelId);
+                    changed = true;
+                }
+            }
+            for (const modelId of Object.keys(next)) {
+                if (!modelIds.includes(modelId)) {
+                    delete next[modelId];
+                    changed = true;
+                }
+            }
+            return changed ? next : current;
+        });
+    }, [modelIds]);
+
+    const handleCreate = useCallback(async () => {
+        if (adding) return;
+        const id = slugFromProvider(provider.label, provider.baseUrl);
+        const baseUrl = provider.baseUrl.trim().replace(/\/(?:chat\/completions|responses|images\/generations|images\/edits)\/?$/, '');
+        if (!id || !baseUrl || !modelIds.length) return;
+        setAdding(true);
+        try {
+            const models = modelIds.map((modelId) => buildModelConfig(modelId, modelDrafts[modelId]));
+            const created = await createRuntimeProvider({
+                id,
+                label: provider.label.trim() || id,
+                type: 'openai-compatible',
+                protocol: provider.protocol,
+                baseUrl,
+                apiKey: provider.apiKey.trim(),
+                badgeColor: provider.badgeColor,
+                models,
+                stream: provider.stream,
+            });
+            notifyProvidersUpdated();
+            await onReload();
+            navigate(`/settings/providers/${created.id}`, { replace: true });
+        } finally {
+            setAdding(false);
+        }
+    }, [adding, modelDrafts, modelIds, navigate, onReload, provider]);
+
+    return (
+        <div>
+            <SectionHeader title="自定义 API" subtitle="添加 OpenAI 协议兼容的图片生成接口" />
+            <Panel>
+                <div className="grid gap-4 xl:grid-cols-2">
+                    <label className="block">
+                        <span className="mb-2 block text-xs text-[var(--text-muted)]">显示名称</span>
+                        <input
+                            value={provider.label}
+                            onChange={(event) => setProvider((value) => ({ ...value, label: event.target.value }))}
+                            placeholder="HMM API"
+                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                        />
+                    </label>
+                    <label className="block">
+                        <span className="mb-2 block text-xs text-[var(--text-muted)]">类型</span>
+                        <input
+                            value="openai-compatible"
+                            readOnly
+                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-muted)] outline-none"
+                        />
+                    </label>
+                    <div className="block">
+                        <ColorPreference
+                            label="标签配色"
+                            value={provider.badgeColor}
+                            onChange={(badgeColor) => setProvider((value) => ({ ...value, badgeColor }))}
+                            defaultValue={CUSTOM_PROVIDER_BADGE_COLOR}
+                        />
+                    </div>
+                    <label className="block">
+                        <span className="mb-2 block text-xs text-[var(--text-muted)]">协议</span>
+                        <select
+                            value={provider.protocol}
+                            onChange={(event) => setProvider((value) => ({ ...value, protocol: event.target.value, stream: event.target.value === 'chat-completions' ? value.stream : false }))}
+                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                        >
+                            {OPENAI_PROTOCOL_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>{option.label}</option>
+                            ))}
+                        </select>
+                    </label>
+                    <label className="block xl:col-span-2">
+                        <span className="mb-2 block text-xs text-[var(--text-muted)]">Base URL</span>
+                        <input
+                            value={provider.baseUrl}
+                            onChange={(event) => setProvider((value) => ({ ...value, baseUrl: event.target.value }))}
+                            placeholder="https://example.com/v1"
+                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                        />
+                    </label>
+                    <label className="block xl:col-span-2">
+                        <span className="mb-2 block text-xs text-[var(--text-muted)]">添加模型</span>
+                        <textarea
+                            value={provider.modelsText}
+                            onChange={(event) => setProvider((value) => ({ ...value, modelsText: event.target.value }))}
+                            rows={3}
+                            placeholder="gpt-image-2, model-a; model-b&#10;支持逗号、分号或换行分隔"
+                            className="w-full resize-none rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                        />
+                    </label>
+                    <label className="block xl:col-span-2">
+                        <span className="mb-2 block text-xs text-[var(--text-muted)]">API Key</span>
+                        <input
+                            value={provider.apiKey}
+                            onChange={(event) => setProvider((value) => ({ ...value, apiKey: event.target.value }))}
+                            placeholder="sk-your-token"
+                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                        />
+                    </label>
+                </div>
+                {modelIds.length > 0 && (
+                    <div className="mt-5 space-y-4">
+                        <div className="flex items-center justify-between gap-3">
+                            <div>
+                                <div className="text-sm font-medium text-[var(--text-primary)]">模型列表</div>
+                                <div className="text-xs text-[var(--text-muted)]">点击模型展开，配置要显示的控件和请求字段。</div>
+                            </div>
+                            {provider.protocol === 'chat-completions' && (
+                                <Toggle checked={provider.stream} onChange={(stream) => setProvider((value) => ({ ...value, stream }))} label="使用流式响应" />
+                            )}
+                        </div>
+                        <div className="space-y-4">
+                            {modelIds.map((modelId) => (
+                                <ModelExposureEditor
+                                    key={modelId}
+                                    modelId={modelId}
+                                    draft={modelDrafts[modelId] || createModelDraft(modelId)}
+                                    onChange={(next) => setModelDrafts((current) => ({ ...current, [modelId]: next }))}
+                                    onRemove={() => setProvider((value) => ({
+                                        ...value,
+                                        modelsText: modelListFromText(value.modelsText).filter((item) => item !== modelId).join('\n'),
+                                    }))}
+                                />
+                            ))}
+                        </div>
+                    </div>
+                )}
+                <div className="mt-5 flex justify-end">
+                    <button
+                        type="button"
+                        onClick={() => void handleCreate()}
+                        disabled={adding || !provider.label.trim() || !provider.baseUrl.trim() || modelIds.length === 0}
+                        className="inline-flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] transition-colors hover:border-[var(--text-muted)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        {adding ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                        保存
+                    </button>
+                </div>
+            </Panel>
         </div>
     );
 }
 
 function ProviderDetails({ provider, onReload }: { provider: RuntimeProvider; onReload: () => Promise<void> }) {
     const isSousaku = provider.type === 'sousaku';
+    const isOpenAICompatible = provider.type === 'openai-compatible';
+    const isBuiltIn = Boolean(provider.builtin);
+    const canEditIdentity = !isBuiltIn;
+    const canEditConnection = !isSousaku;
+    const canEditCustomSchema = !isBuiltIn && !isSousaku;
+    const canDelete = !provider.builtin;
+    const navigate = useNavigate();
     const [label, setLabel] = useState(provider.label);
     const [enabled, setEnabled] = useState(provider.enabled);
+    const [protocol, setProtocol] = useState(provider.protocol || 'images');
     const [baseUrl, setBaseUrl] = useState(provider.baseUrl);
     const [apiKey, setApiKey] = useState(provider.apiKey || '');
+    const [modelsText, setModelsText] = useState((provider.models || []).map((model) => model.value).join('\n'));
+    const [badgeColor, setBadgeColor] = useState(provider.badgeColor || CUSTOM_PROVIDER_BADGE_COLOR);
+    const [stream, setStream] = useState(Boolean(provider.stream));
     const [notes, setNotes] = useState(provider.notes || '');
     const [saving, setSaving] = useState(false);
+    const [deleting, setDeleting] = useState(false);
+    const [modelDrafts, setModelDrafts] = useState<Record<string, ModelDraft>>({});
+    const modelIds = useMemo(() => modelListFromText(modelsText), [modelsText]);
 
     useEffect(() => {
         setLabel(provider.label);
         setEnabled(provider.enabled);
+        setProtocol(provider.protocol || 'images');
         setBaseUrl(provider.baseUrl);
         setApiKey(provider.apiKey || '');
+        setModelsText((provider.models || []).map((model) => model.value).join('\n'));
+        setBadgeColor(provider.badgeColor || CUSTOM_PROVIDER_BADGE_COLOR);
+        setStream(Boolean(provider.stream));
         setNotes(provider.notes || '');
+        setModelDrafts(Object.fromEntries(
+            (provider.models || []).map((model) => [
+                model.value,
+                createModelDraft(model.value, model),
+            ])
+        ));
     }, [provider]);
+
+    useEffect(() => {
+        setModelDrafts((current) => {
+            const next = { ...current };
+            let changed = false;
+            for (const modelId of modelIds) {
+                if (!next[modelId]) {
+                    const sourceModel = (provider.models || []).find((item) => item.value === modelId);
+                    next[modelId] = createModelDraft(modelId, sourceModel);
+                    changed = true;
+                }
+            }
+            for (const modelId of Object.keys(next)) {
+                if (!modelIds.includes(modelId)) {
+                    delete next[modelId];
+                    changed = true;
+                }
+            }
+            return changed ? next : current;
+        });
+    }, [modelIds, provider.models, provider.type]);
 
     const handleSave = useCallback(async () => {
         if (saving) return;
         setSaving(true);
         try {
+            const models = modelIds.map((modelId) => buildModelConfig(modelId, modelDrafts[modelId] || createModelDraft(modelId)));
             await saveRuntimeProvider(provider.id, {
-                label: label.trim() || provider.label,
                 enabled,
-                ...(!isSousaku ? {
+                ...(canEditIdentity ? { label: label.trim() || provider.label } : {}),
+                ...(canEditConnection ? {
                     baseUrl: baseUrl.trim(),
                     apiKey: apiKey.trim(),
+                } : {}),
+                ...(canEditCustomSchema ? {
+                    ...(isOpenAICompatible ? { protocol } : {}),
+                    badgeColor,
+                    models,
+                    ...(isOpenAICompatible ? { stream } : {}),
                 } : {}),
                 notes: notes.trim(),
             });
@@ -543,7 +1200,20 @@ function ProviderDetails({ provider, onReload }: { provider: RuntimeProvider; on
         } finally {
             setSaving(false);
         }
-    }, [apiKey, baseUrl, enabled, isSousaku, label, notes, onReload, provider.id, provider.label, saving]);
+    }, [apiKey, badgeColor, baseUrl, canEditConnection, canEditCustomSchema, canEditIdentity, enabled, isOpenAICompatible, label, modelDrafts, modelIds, notes, onReload, protocol, provider.id, provider.label, provider.type, saving, stream]);
+
+    const handleDelete = useCallback(async () => {
+        if (!canDelete || deleting) return;
+        setDeleting(true);
+        try {
+            await deleteRuntimeProvider(provider.id);
+            notifyProvidersUpdated();
+            await onReload();
+            navigate('/settings/providers', { replace: true });
+        } finally {
+            setDeleting(false);
+        }
+    }, [canDelete, deleting, navigate, onReload, provider.id]);
 
     return (
         <div>
@@ -553,6 +1223,17 @@ function ProviderDetails({ provider, onReload }: { provider: RuntimeProvider; on
                 actions={
                     <>
                         <SourceBadge source={provider.source} />
+                        {canDelete && (
+                            <button
+                                type="button"
+                                onClick={() => void handleDelete()}
+                                disabled={deleting}
+                                className="inline-flex items-center gap-2 rounded-lg border border-red-500/30 px-3 py-2 text-sm text-red-300 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                                删除
+                            </button>
+                        )}
                         <button
                             type="button"
                             onClick={handleSave}
@@ -568,55 +1249,118 @@ function ProviderDetails({ provider, onReload }: { provider: RuntimeProvider; on
             <Panel>
                 <div className="grid gap-4 xl:grid-cols-2">
                     <label className="block">
-                        <span className="mb-2 block text-xs text-[var(--text-muted)]">显示名称</span>
+                        <FieldLabel locked={!canEditIdentity}>显示名称</FieldLabel>
                         <input
                             value={label}
                             onChange={(event) => setLabel(event.target.value)}
-                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                            readOnly={!canEditIdentity}
+                            className={fieldClassName(!canEditIdentity)}
                         />
                     </label>
                     <label className="block">
-                        <span className="mb-2 block text-xs text-[var(--text-muted)]">类型</span>
+                        <FieldLabel locked>类型</FieldLabel>
                         <input
                             value={provider.type}
                             readOnly
-                            className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-muted)] outline-none"
+                            className={fieldClassName(true)}
                         />
                     </label>
+                    {isOpenAICompatible && (
+                        <label className="block">
+                            <FieldLabel locked={!canEditCustomSchema}>协议</FieldLabel>
+                            <select
+                                value={protocol}
+                                onChange={(event) => setProtocol(event.target.value)}
+                                disabled={!canEditCustomSchema}
+                                className={fieldClassName(!canEditCustomSchema)}
+                            >
+                                {OPENAI_PROTOCOL_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                            </select>
+                        </label>
+                    )}
                     {!isSousaku && (
                         <>
                             <label className="block xl:col-span-2">
-                                <span className="mb-2 block text-xs text-[var(--text-muted)]">Base URL</span>
+                                <FieldLabel>Base URL</FieldLabel>
                                 <input
                                     value={baseUrl}
                                     onChange={(event) => setBaseUrl(event.target.value)}
-                                    className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                                    className={fieldClassName(false, 'font-mono')}
                                 />
                             </label>
                             <label className="block">
-                                <span className="mb-2 block text-xs text-[var(--text-muted)]">API Key</span>
+                                <FieldLabel>API Key</FieldLabel>
                                 <input
                                     value={apiKey}
                                     onChange={(event) => setApiKey(event.target.value)}
                                     placeholder="未配置"
-                                    className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 font-mono text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                                    className={fieldClassName(false, 'font-mono')}
+                                />
+                            </label>
+                            <label className="block xl:col-span-2">
+                                <FieldLabel locked={!canEditCustomSchema}>添加模型</FieldLabel>
+                                <textarea
+                                    value={modelsText}
+                                    onChange={(event) => setModelsText(event.target.value)}
+                                    rows={3}
+                                    readOnly={!canEditCustomSchema}
+                                    placeholder="gpt-image-2, model-a; model-b&#10;支持逗号、分号或换行分隔"
+                                    className={fieldClassName(!canEditCustomSchema, 'resize-none font-mono')}
                                 />
                             </label>
                         </>
                     )}
+                    {isOpenAICompatible && canEditCustomSchema && (
+                        <>
+                            <div className="block">
+                                <ColorPreference
+                                    label="标签配色"
+                                    value={badgeColor}
+                                    onChange={setBadgeColor}
+                                    defaultValue={CUSTOM_PROVIDER_BADGE_COLOR}
+                                />
+                            </div>
+                        </>
+                    )}
+                    {isOpenAICompatible && canEditCustomSchema && protocol === 'chat-completions' && (
+                        <div className="xl:col-span-2">
+                            <Toggle checked={stream} onChange={setStream} label="使用流式响应" />
+                        </div>
+                    )}
                     <div className="xl:col-span-2">
                         <Toggle checked={enabled} onChange={setEnabled} label="启用 Provider" />
                     </div>
-                    <label className="block xl:col-span-2">
-                        <span className="mb-2 block text-xs text-[var(--text-muted)]">备注</span>
-                        <textarea
-                            value={notes}
-                            onChange={(event) => setNotes(event.target.value)}
-                            rows={3}
-                            className="w-full resize-none rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
-                        />
-                    </label>
                 </div>
+                {isOpenAICompatible && canEditCustomSchema && modelIds.length > 0 && (
+                    <div className="mt-5 space-y-4">
+                        <div>
+                            <div className="text-sm font-medium text-[var(--text-primary)]">模型列表</div>
+                            <div className="text-xs text-[var(--text-muted)]">点击模型展开，配置要显示的控件和请求字段。默认模型会自动取列表第一项。</div>
+                        </div>
+                        <div className="space-y-4">
+                            {modelIds.map((modelId) => (
+                                <ModelExposureEditor
+                                    key={modelId}
+                                    modelId={modelId}
+                                    draft={modelDrafts[modelId] || createModelDraft(modelId)}
+                                    onChange={(next) => setModelDrafts((current) => ({ ...current, [modelId]: next }))}
+                                    onRemove={() => setModelsText((value) => modelListFromText(value).filter((item) => item !== modelId).join('\n'))}
+                                />
+                            ))}
+                        </div>
+                    </div>
+                )}
+                <label className="mt-5 block xl:col-span-2">
+                    <FieldLabel>备注</FieldLabel>
+                    <textarea
+                        value={notes}
+                        onChange={(event) => setNotes(event.target.value)}
+                        rows={3}
+                        className={fieldClassName(false, 'resize-none')}
+                    />
+                </label>
                 <div className="mt-5">
                     <div className="mb-2 text-xs text-[var(--text-muted)]">能力</div>
                     <div className="flex flex-wrap gap-2">
@@ -630,7 +1374,6 @@ function ProviderDetails({ provider, onReload }: { provider: RuntimeProvider; on
                         ))}
                     </div>
                 </div>
-                {provider.notes && <p className="mt-5 text-sm text-[var(--text-muted)]">{provider.notes}</p>}
             </Panel>
         </div>
     );
@@ -648,6 +1391,11 @@ function JobsPanel({ settings }: { settings?: BackendSettings }) {
                     label="默认超时"
                     value={`${Math.round((settings?.jobs.defaultTimeoutSeconds.value || 0) / 60)} 分钟`}
                     source={settings?.jobs.defaultTimeoutSeconds.source}
+                />
+                <SettingRow
+                    label="Sousaku 卡死判定"
+                    value={`${Math.round((settings?.jobs.sousakuStaleTaskSeconds.value || 0) / 60)} 分钟`}
+                    source={settings?.jobs.sousakuStaleTaskSeconds.source}
                 />
                 <div className="py-3">
                     <div className="mb-3 text-sm font-medium text-[var(--text-secondary)]">Provider 并发</div>
@@ -671,6 +1419,9 @@ function StoragePanel({ settings, onReload }: { settings?: BackendSettings; onRe
     const [thumbnailQuality, setThumbnailQuality] = useState(78);
     const [thumbnailCacheMaxGb, setThumbnailCacheMaxGb] = useState(3);
     const [saving, setSaving] = useState(false);
+    const [usage, setUsage] = useState<StorageUsage | null>(null);
+    const [usageLoading, setUsageLoading] = useState(false);
+    const [clearingCache, setClearingCache] = useState<'thumbnails' | null>(null);
     const reloadGalleryFromServer = useStore((state) => state.reloadGalleryFromServer);
 
     useEffect(() => {
@@ -679,6 +1430,21 @@ function StoragePanel({ settings, onReload }: { settings?: BackendSettings; onRe
         setThumbnailQuality(settings?.gallery.thumbnailQuality.value || 78);
         setThumbnailCacheMaxGb(settings?.gallery.thumbnailCacheMaxGb.value || 3);
     }, [settings]);
+
+    const refreshUsage = useCallback(async () => {
+        setUsageLoading(true);
+        try {
+            setUsage(await loadStorageUsage());
+        } catch (error) {
+            console.error('Failed to load storage usage:', error);
+        } finally {
+            setUsageLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        refreshUsage();
+    }, [refreshUsage, settings?.paths.saveDir.resolved]);
 
     const handleSave = useCallback(async () => {
         if (saving) return;
@@ -696,10 +1462,25 @@ function StoragePanel({ settings, onReload }: { settings?: BackendSettings; onRe
             });
             await onReload();
             await reloadGalleryFromServer();
+            await refreshUsage();
         } finally {
             setSaving(false);
         }
-    }, [onReload, reloadGalleryFromServer, saveDir, saving, thumbnailCacheMaxGb, thumbnailQuality, thumbnailWidth]);
+    }, [onReload, refreshUsage, reloadGalleryFromServer, saveDir, saving, thumbnailCacheMaxGb, thumbnailQuality, thumbnailWidth]);
+
+    const handleClearCache = useCallback(async (cacheName: 'thumbnails') => {
+        if (clearingCache) return;
+        setClearingCache(cacheName);
+        try {
+            await clearStorageCache(cacheName);
+            await refreshUsage();
+        } catch (error) {
+            console.error('Failed to clear cache:', error);
+            window.alert(error instanceof Error ? error.message : '清理缓存失败');
+        } finally {
+            setClearingCache(null);
+        }
+    }, [clearingCache, refreshUsage]);
 
     return (
         <div>
@@ -779,6 +1560,109 @@ function StoragePanel({ settings, onReload }: { settings?: BackendSettings; onRe
                     <SettingRow label="图廊数据库" value={<PathValue value={settings?.paths.galleryDb} />} source={settings?.paths.galleryDb.source} />
                 </Panel>
             </div>
+            <div className="mt-4">
+                <Panel>
+                    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                            <HardDrive className="h-4 w-4 text-[var(--accent-primary)]" />
+                            存储空间管理
+                        </div>
+                        <button
+                            type="button"
+                            onClick={refreshUsage}
+                            disabled={usageLoading}
+                            className="inline-flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-[var(--text-muted)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                            <RotateCw className={`h-3.5 w-3.5 ${usageLoading ? 'animate-spin' : ''}`} />
+                            刷新
+                        </button>
+                    </div>
+                    <div className="grid gap-3 lg:grid-cols-3">
+                        <StorageUsageCard
+                            title="画廊文件"
+                            value={formatBytes(usage?.gallery.bytes)}
+                            meta={`${usage?.gallery.files ?? 0} 个文件 / ${usage?.gallery.records ?? 0} 条记录`}
+                            details={[
+                                `其中本地导入：${usage?.gallery.imports.files ?? 0} 张，${formatBytes(usage?.gallery.imports.bytes)}`,
+                                `缺失文件：${usage?.gallery.missing ?? 0}`,
+                            ]}
+                        />
+                        <StorageUsageCard
+                            title="缩略图缓存"
+                            value={formatBytes(usage?.thumbnailCache.bytes)}
+                            meta={`${usage?.thumbnailCache.files ?? 0} 个文件 / 上限 ${formatBytes(usage?.thumbnailCache.maxBytes)}`}
+                            path={usage?.thumbnailCache.path}
+                            actionLabel="释放"
+                            actionLoading={clearingCache === 'thumbnails'}
+                            actionDisabled={!usage?.thumbnailCache.bytes}
+                            onAction={() => handleClearCache('thumbnails')}
+                        />
+                        <StorageUsageCard
+                            title="参考图库"
+                            value={formatBytes(usage?.referenceLibrary?.bytes)}
+                            meta={`${usage?.referenceLibrary?.assets.files ?? 0} 张原图 / ${usage?.referenceLibrary?.thumbnails.files ?? 0} 个预览`}
+                            path={usage?.referenceLibrary?.path}
+                            details={[
+                                `原图：${formatBytes(usage?.referenceLibrary?.assets.bytes)}`,
+                                `预览：${formatBytes(usage?.referenceLibrary?.thumbnails.bytes)}`,
+                            ]}
+                        />
+                    </div>
+                </Panel>
+            </div>
+        </div>
+    );
+}
+
+function StorageUsageCard({
+    title,
+    value,
+    meta,
+    path,
+    details = [],
+    actionLabel,
+    actionLoading,
+    actionDisabled,
+    onAction,
+}: {
+    title: string;
+    value: string;
+    meta: string;
+    path?: string;
+    details?: string[];
+    actionLabel?: string;
+    actionLoading?: boolean;
+    actionDisabled?: boolean;
+    onAction?: () => void;
+}) {
+    return (
+        <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-4">
+            <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                    <div className="text-sm font-medium text-[var(--text-secondary)]">{title}</div>
+                    <div className="mt-2 text-2xl font-semibold text-[var(--text-primary)]">{value}</div>
+                    <div className="mt-1 text-xs text-[var(--text-muted)]">{meta}</div>
+                </div>
+                {actionLabel && onAction && (
+                    <button
+                        type="button"
+                        onClick={onAction}
+                        disabled={actionDisabled || actionLoading}
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:border-rose-400/40 hover:bg-rose-500/10 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                        {actionLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                        {actionLabel}
+                    </button>
+                )}
+            </div>
+            {(path || details.length > 0) && (
+                <div className="mt-3 space-y-1 text-xs text-[var(--text-muted)]">
+                    {path && <div className="truncate font-mono">{path}</div>}
+                    {details.map((detail) => (
+                        <div key={detail}>{detail}</div>
+                    ))}
+                </div>
+            )}
         </div>
     );
 }
@@ -791,6 +1675,11 @@ function NetworkPanel({ settings }: { settings?: BackendSettings }) {
             <Panel>
                 <SettingRow label="HTTP 代理" value={proxies?.http || '未启用'} source={settings?.network.httpProxies.source} />
                 <SettingRow label="HTTPS 代理" value={proxies?.https || '未启用'} source={settings?.network.httpProxies.source} />
+                <SettingRow
+                    label="公网 URL 有效期"
+                    value={`${Math.round((settings?.network.publicUrlTtlSeconds.value || 0) / 60)} 分钟`}
+                    source={settings?.network.publicUrlTtlSeconds.source}
+                />
             </Panel>
         </div>
     );
@@ -810,6 +1699,9 @@ function AdvancedPanel({ settings }: { settings?: BackendSettings }) {
                     <SettingRow label="后端端口" value={String(settings?.server.backendPort.value ?? '-')} source={settings?.server.backendPort.source} />
                     <SettingRow label="前端端口" value={String(settings?.server.frontendPort.value ?? '-')} source={settings?.server.frontendPort.source} />
                     <SettingRow label="自动重载" value={settings?.server.useReloader.value ? '开启' : '关闭'} source={settings?.server.useReloader.source} />
+                    <SettingRow label="日志等级" value={settings?.logging.level.value ?? '-'} source={settings?.logging.level.source} />
+                    <SettingRow label="日志颜色" value={settings?.logging.color.value ? '开启' : '关闭'} source={settings?.logging.color.source} />
+                    <SettingRow label="Sousaku 进度面板" value={settings?.logging.sousakuProgressPanel.value ? '开启' : '关闭'} source={settings?.logging.sousakuProgressPanel.source} />
                 </Panel>
                 <Panel>
                     <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
@@ -821,9 +1713,9 @@ function AdvancedPanel({ settings }: { settings?: BackendSettings }) {
                             key={key}
                             label={key}
                             value={
-                                <div className="flex items-center gap-2">
-                                    {file.exists ? <Check className="h-4 w-4 text-emerald-400" /> : <span className="h-4 w-4 rounded-full border border-[var(--border-subtle)]" />}
-                                    <span className="font-mono text-xs">{file.path}</span>
+                                <div className="flex min-w-0 items-center gap-2">
+                                    {file.exists ? <Check className="h-4 w-4 shrink-0 text-emerald-400" /> : <span className="h-4 w-4 shrink-0 rounded-full border border-[var(--border-subtle)]" />}
+                                    <span className="min-w-0 truncate font-mono text-xs">{file.path}</span>
                                 </div>
                             }
                             source={file.exists ? '文件存在' : '未创建'}
@@ -898,6 +1790,8 @@ export function SettingsPage() {
 
     const handleResetDefaults = useCallback(async () => {
         if (resetting) return;
+        const confirmed = window.confirm('恢复默认配置会重置全部设置，包括图片保存目录、并发、网络和偏好设置。确定继续吗？');
+        if (!confirmed) return;
         setResetting(true);
         try {
             await resetUiSettingsToDefaults();
@@ -922,7 +1816,7 @@ export function SettingsPage() {
                         className="inline-flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] transition-colors hover:border-[var(--text-muted)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                         {resetting ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCw className="h-4 w-4" />}
-                        恢复默认
+                        恢复默认配置
                     </button>
                 </div>
             </section>

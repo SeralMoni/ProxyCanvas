@@ -1,7 +1,7 @@
 import Masonry from 'react-masonry-css';
 import { useStore } from '../../store';
 import { useMemo, useCallback, useState, useRef, useEffect, memo } from 'react';
-import type { MouseEvent as ReactMouseEvent } from 'react';
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { motion } from 'framer-motion';
 import { Star, Trash2, Loader2 } from 'lucide-react';
 import { format } from 'date-fns';
@@ -16,7 +16,8 @@ import {
     batchUpdateGalleryTags,
 } from '../../services/api';
 import { useProviders } from '../../hooks/useProviders';
-import { providerBadgeClass, providerLabel } from '../../utils/providers';
+import { providerBadgeClass, providerBadgeStyle, providerLabel } from '../../utils/providers';
+import { normalizePromptText } from '../../utils/prompt';
 
 const INITIAL_LOAD = 60;
 const LOAD_MORE = 30;
@@ -123,12 +124,13 @@ interface GalleryCardProps {
     tagColor: string;
     providerName: string;
     providerBadge: string;
+    providerBadgeStyle?: CSSProperties;
     onSelect: (image: ImageItem, event: ReactMouseEvent) => void;
     onContextMenu: (image: ImageItem, event: ReactMouseEvent) => void;
     registerCard: (id: string, node: HTMLDivElement | null) => void;
 }
 
-const GalleryCard = memo(function GalleryCard({ image, isSelected, selectionColor, tagColor, providerName, providerBadge, onSelect, onContextMenu, registerCard }: GalleryCardProps) {
+const GalleryCard = memo(function GalleryCard({ image, isSelected, selectionColor, tagColor, providerName, providerBadge, providerBadgeStyle, onSelect, onContextMenu, registerCard }: GalleryCardProps) {
     const toggleFavorite = useStore((s) => s.toggleFavorite);
     const removeImage = useStore((s) => s.removeImage);
     const deleteLocalFile = useStore((s) => s.deleteLocalFile);
@@ -189,7 +191,10 @@ const GalleryCard = memo(function GalleryCard({ image, isSelected, selectionColo
                             <span className="text-white/60 text-xs">
                                 {format(new Date(image.createdAt), 'M月d日 HH:mm', { locale: zhCN })}
                             </span>
-                            <span className={`text-xs px-2 py-0.5 rounded ${providerBadge}`}>
+                            <span
+                                className={`text-xs px-2 py-0.5 rounded ${providerBadge}`}
+                                style={providerBadgeStyle}
+                            >
                                 {providerName}
                             </span>
                         </div>
@@ -276,11 +281,16 @@ function isInteractiveTarget(target: EventTarget | null) {
     return target instanceof HTMLElement && Boolean(target.closest('button,input,textarea,select,a,[data-no-selection="true"]'));
 }
 
+function isGalleryCardTarget(target: EventTarget | null) {
+    return target instanceof HTMLElement && Boolean(target.closest('[data-gallery-card="true"]'));
+}
+
 function GalleryContextMenu({
     state,
     count,
     allFavorite,
     onClose,
+    onReusePrompt,
     onDelete,
     onExport,
     onAddTag,
@@ -291,6 +301,7 @@ function GalleryContextMenu({
     count: number;
     allFavorite: boolean;
     onClose: () => void;
+    onReusePrompt?: () => void;
     onDelete: () => void;
     onExport: () => void;
     onAddTag: () => void;
@@ -325,6 +336,9 @@ function GalleryContextMenu({
             <div className="border-b border-[var(--border-subtle)] px-3 py-2 text-xs text-[var(--text-muted)]">
                 已选 {count} 张
             </div>
+            {count === 1 && onReusePrompt && (
+                <button className={itemClass} onClick={onReusePrompt}>复用提示词</button>
+            )}
             <button className={itemClass} onClick={onExport}>另存为...</button>
             <button className={itemClass} onClick={onAddTag}>添加标签</button>
             <button className={itemClass} onClick={onRemoveTag}>移除标签</button>
@@ -362,6 +376,7 @@ export function Gallery() {
     const addTagsToImagesLocal = useStore((s) => s.addTagsToImagesLocal);
     const removeTagsFromImagesLocal = useStore((s) => s.removeTagsFromImagesLocal);
     const setImagesFavoriteLocal = useStore((s) => s.setImagesFavoriteLocal);
+    const setCurrentPrompt = useStore((s) => s.setCurrentPrompt);
     const galleryColumns = useStore((s) => s.galleryColumns);
     const galleryDisplayMode = useStore((s) => s.galleryDisplayMode);
     const galleryPageSize = useStore((s) => s.galleryPageSize);
@@ -393,6 +408,10 @@ export function Gallery() {
     const selectionStartRef = useRef<{ x: number; y: number; additive: boolean } | null>(null);
     const isSelectingRef = useRef(false);
     const suppressNextClickRef = useRef(false);
+
+    useEffect(() => {
+        window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+    }, []);
 
     // Filter images based on current filters
     const filteredImages = useMemo(() => {
@@ -472,7 +491,7 @@ export function Gallery() {
         const observer = new IntersectionObserver(
             (entries) => {
                 if (entries[0].isIntersecting) {
-                    setVisibleCount((prev) => prev + LOAD_MORE);
+                    setVisibleCount((prev) => Math.min(prev + LOAD_MORE, filteredImages.length));
                 }
             },
             { rootMargin: '400px' }
@@ -480,7 +499,7 @@ export function Gallery() {
 
         observer.observe(sentinel);
         return () => observer.disconnect();
-    }, [galleryDisplayMode, hasMore]);
+    }, [filteredImages.length, galleryDisplayMode, hasMore, visibleCount]);
 
     const registerCard = useCallback((id: string, node: HTMLDivElement | null) => {
         if (node) {
@@ -492,7 +511,13 @@ export function Gallery() {
 
     useEffect(() => {
         const handleClick = (event: MouseEvent) => {
-            if (selectedImage || selectedImageIds.length === 0 || suppressNextClickRef.current || isInteractiveTarget(event.target)) return;
+            if (
+                selectedImage ||
+                selectedImageIds.length === 0 ||
+                suppressNextClickRef.current ||
+                isInteractiveTarget(event.target) ||
+                isGalleryCardTarget(event.target)
+            ) return;
             clearSelectedImageIds();
             setContextMenu(null);
         };
@@ -639,13 +664,28 @@ export function Gallery() {
         });
     }, [clearSelectedImageIds, contextMenu, deleteLocalFile, removeImagesLocal, runBatchAction]);
 
+    const handleReusePrompt = useCallback(() => {
+        const ids = contextMenu?.ids ?? [];
+        if (ids.length !== 1) return;
+        const image = images.find((item) => item.id === ids[0]);
+        if (!image) return;
+        setCurrentPrompt(normalizePromptText(image.prompt || ''));
+        setContextMenu(null);
+    }, [contextMenu, images, setCurrentPrompt]);
+
     const handleBatchExport = useCallback(() => {
         const ids = contextMenu?.ids ?? [];
         if (!ids.length) return;
         void runBatchAction(async () => {
             const result = await batchExportGalleryImages(ids);
             if (result.cancelled) return;
-            window.alert(`已另存为 ${result.exported} 张，跳过 ${result.skipped} 张。\n${result.directory}`);
+            if (result.skipped > 0) {
+                throw new Error(
+                    result.exported > 0
+                        ? `另存为完成，但跳过 ${result.skipped} 张。`
+                        : '另存为失败：没有可保存的图片。'
+                );
+            }
         });
     }, [contextMenu, runBatchAction]);
 
@@ -729,6 +769,7 @@ export function Gallery() {
                             tagColor={galleryTagColor}
                             providerName={providerLabel(image.apiType, providers)}
                             providerBadge={providerBadgeClass(image.apiType)}
+                            providerBadgeStyle={providerBadgeStyle(image.apiType, providers)}
                             onSelect={handleSelect}
                             onContextMenu={handleCardContextMenu}
                             registerCard={registerCard}
@@ -740,10 +781,9 @@ export function Gallery() {
                 {hasMore && (
                     <div
                         ref={sentinelRef}
-                        className="flex justify-center py-8"
-                    >
-                        <Loader2 className="w-6 h-6 animate-spin text-[var(--text-muted)]" />
-                    </div>
+                        aria-hidden="true"
+                        className="h-10"
+                    />
                 )}
 
                 {galleryDisplayMode === 'pagination' && filteredImages.length > pageSize && (
@@ -803,14 +843,14 @@ export function Gallery() {
             {selectedImageIds.length > 0 && !contextMenu && (
                 <div
                     data-no-selection="true"
-                    className="fixed bottom-5 left-1/2 z-[65] flex -translate-x-1/2 items-center gap-3 rounded-full border border-[var(--border-subtle)] bg-[rgba(24,24,27,0.92)] px-4 py-2 text-sm text-[var(--text-secondary)] shadow-lg backdrop-blur-xl"
+                    className="fixed right-5 top-5 z-[65] flex items-center gap-3 rounded-full border border-[var(--border-subtle)] bg-[rgba(24,24,27,0.92)] px-4 py-2 text-sm text-[var(--text-secondary)] shadow-lg backdrop-blur-xl md:right-7 md:top-6"
                 >
                     <span>已选 {selectedImageIds.length} 张</span>
                     <button
-                        className="rounded-full px-2 py-1 text-xs text-[var(--text-muted)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)]"
+                        className="rounded-full border border-[var(--border-subtle)] px-2 py-0.5 text-xs text-[var(--text-muted)] hover:bg-[var(--bg-card-hover)] hover:text-[var(--text-primary)]"
                         onClick={clearSelectedImageIds}
                     >
-                        取消
+                        Esc
                     </button>
                 </div>
             )}
@@ -821,6 +861,7 @@ export function Gallery() {
                     count={contextMenu.ids.length}
                     allFavorite={allContextFavorites}
                     onClose={() => setContextMenu(null)}
+                    onReusePrompt={contextMenu.ids.length === 1 ? handleReusePrompt : undefined}
                     onDelete={handleBatchDelete}
                     onExport={handleBatchExport}
                     onAddTag={handleBatchAddTag}

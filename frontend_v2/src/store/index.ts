@@ -2,10 +2,10 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { useShallow } from 'zustand/react/shallow';
 import type { BackendCapabilities, ImageItem, FilterState, UploadedImage, GenerateParams, ThoughtImage } from '../types';
-import { getBackendCapabilities, loadBackendSettings, loadGallery, resetBackendSettings, saveBackendSettings, saveToGallery, deleteFromGallery, updateGalleryTags } from '../services/api';
+import { getBackendCapabilities, importReferenceImageUrl, loadBackendSettings, loadGallery, loadReferenceImages, resetBackendSettings, saveBackendSettings, saveToGallery, deleteFromGallery, deleteReferenceImage, updateGalleryTags, uploadReferenceImage } from '../services/api';
 
 export type GalleryColumnSize = 5 | 6 | 7;
-export type ApiType = 'apimart' | 'openai' | 'nanobanana2' | 'cliproxy' | 'sousaku';
+export type ApiType = string;
 export type GalleryDisplayMode = 'waterfall' | 'pagination';
 
 export const DEFAULT_GALLERY_PAGE_SIZE = 60;
@@ -76,20 +76,28 @@ function mergeTags(existing: string[], images: ImageItem[]): string[] {
     return changed ? Array.from(tags).sort() : existing;
 }
 
-function mergeTagValues(existing: string[], values: string[]): string[] {
-    const tags = new Set(existing);
-    let changed = false;
-    values.forEach((tag) => {
-        const cleaned = tag.trim();
-        if (cleaned && !tags.has(cleaned)) {
-            tags.add(cleaned);
-            changed = true;
-        }
-    });
-    return changed ? Array.from(tags).sort() : existing;
+function gallerySortValue(image: ImageItem) {
+    const time = new Date(image.createdAt).getTime();
+    return Number.isFinite(time) ? time : 0;
 }
 
-const DEFAULT_PER_API_PARAMS: Record<ApiType, GenerateParams> = {
+function galleryResultIndex(image: ImageItem) {
+    const raw = (image as ImageItem & { resultIndex?: unknown }).resultIndex;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : Number.MAX_SAFE_INTEGER;
+}
+
+function sortGalleryImages(images: ImageItem[]) {
+    return [...images].sort((a, b) => {
+        const byTime = gallerySortValue(b) - gallerySortValue(a);
+        if (byTime !== 0) return byTime;
+        const byResultIndex = galleryResultIndex(a) - galleryResultIndex(b);
+        if (byResultIndex !== 0) return byResultIndex;
+        return a.id.localeCompare(b.id);
+    });
+}
+
+const DEFAULT_PER_API_PARAMS: Record<string, GenerateParams> = {
     openai: {
         ratio: '16:9',
         imageCount: 1,
@@ -123,7 +131,7 @@ const DEFAULT_PER_API_PARAMS: Record<ApiType, GenerateParams> = {
     },
 };
 
-const DEFAULT_SELECTED_MODELS: Record<ApiType, string> = {
+const DEFAULT_SELECTED_MODELS: Record<string, string> = {
     openai: 'gpt-image-2',
     cliproxy: 'gpt-image-2',
     nanobanana2: 'gemini-3.1-flash-image',
@@ -161,7 +169,7 @@ function mergeGenerateParams(
     state: Pick<AppState, 'sharedGenerateParams' | 'perApiParams' | 'perApiModelParams'>,
 ): GenerateParams {
     return normalizeGenerateParams({
-        ...DEFAULT_PER_API_PARAMS[api],
+        ...(DEFAULT_PER_API_PARAMS[api] || { ratio: '16:9', quality: 'high', imageCount: 1 }),
         ...(state.perApiParams?.[api] || {}),
         ...(state.perApiModelParams?.[api]?.[model] || {}),
         ...(state.sharedGenerateParams || {}),
@@ -177,7 +185,7 @@ function modelParamKey(api: ApiType): 'apimartModel' | 'cliproxyModel' | 'sousak
 
 function buildModelSnapshot(api: ApiType, model: string, base?: Partial<GenerateParams>): GenerateParams {
     const snapshot = normalizeGenerateParams({
-        ...DEFAULT_PER_API_PARAMS[api],
+        ...(DEFAULT_PER_API_PARAMS[api] || { ratio: '16:9', quality: 'high', imageCount: 1 }),
         ...(base || {}),
     } as GenerateParams);
     if (api === 'apimart') snapshot.apimartModel = model;
@@ -193,7 +201,7 @@ function resolveSelectedModel(api: ApiType, state: Pick<AppState, 'selectedModel
     return (
         state.selectedModelByApi?.[api] ||
         (typeof currentModel === 'string' ? currentModel : '') ||
-        DEFAULT_SELECTED_MODELS[api]
+        DEFAULT_SELECTED_MODELS[api] || 'gpt-image-2'
     );
 }
 
@@ -214,8 +222,9 @@ interface AppState {
     addTagsToImagesLocal: (ids: string[], tags: string[]) => void;
     removeTagsFromImagesLocal: (ids: string[], tags: string[]) => void;
     setImagesFavoriteLocal: (ids: string[], favorite: boolean) => void;
-    updateImage: (id: string, updates: Partial<ImageItem>) => void;
+    updateImage: (id: string, updates: Partial<ImageItem>) => boolean;
     removeImage: (id: string) => void;
+    removeImageLocalOnly: (id: string) => void;
     toggleFavorite: (id: string) => void;
     addTagToImage: (id: string, tag: string) => void;
     removeTagFromImage: (id: string, tag: string) => void;
@@ -237,16 +246,24 @@ interface AppState {
     setSelectedApi: (api: ApiType) => void;
     sharedGenerateParams: Partial<GenerateParams>;
     perApiParams: Record<string, GenerateParams>;
-    selectedModelByApi: Record<ApiType, string>;
-    perApiModelParams: Record<ApiType, Record<string, GenerateParams>>;
+    selectedModelByApi: Record<string, string>;
+    perApiModelParams: Record<string, Record<string, GenerateParams>>;
     setSelectedModel: (model: string) => void;
     setGenerateParams: (params: Partial<GenerateParams>) => void;
 
     // Upload state
     uploadedImages: UploadedImage[];
+    selectedReferenceIds: string[];
     addUploadedImage: (image: UploadedImage) => void;
-    removeUploadedImage: (id: string) => void;
+    updateUploadedImage: (id: string, updates: Partial<UploadedImage>) => void;
+    removeUploadedImage: (id: string) => Promise<void>;
     clearUploadedImages: () => void;
+    loadReferenceImagesFromServer: (options?: { reset?: boolean; limit?: number }) => Promise<{ loaded: number; total: number }>;
+    uploadReferenceImages: (files: File[]) => Promise<void>;
+    addReferenceUrl: (url: string) => void;
+    setSelectedReferenceIds: (ids: string[]) => void;
+    clearSelectedReferenceIds: () => void;
+    toggleSelectedReferenceId: (id: string) => void;
 
     // Mask state (in-memory only, NOT persisted)
     maskData: Record<string, string>;      // imageId -> mask PNG dataURL
@@ -348,10 +365,7 @@ export const useStore = create<AppState>()(
                 if (get().galleryLoaded) return;
                 try {
                     const data = await loadGallery();
-                    // Sort by createdAt descending so newest images appear first
-                    const sorted = [...data.images].sort((a, b) =>
-                        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-                    );
+                    const sorted = sortGalleryImages(data.images);
                     set({ images: sorted, allTags: deriveTags(sorted), galleryLoaded: true });
                     console.log(`📦 Loaded ${data.images.length} images from server`);
                 } catch (e) {
@@ -364,10 +378,7 @@ export const useStore = create<AppState>()(
                 set({ galleryLoaded: false });
                 try {
                     const data = await loadGallery();
-                    // Sort by createdAt descending so newest images appear first
-                    const sorted = [...data.images].sort((a, b) =>
-                        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-                    );
+                    const sorted = sortGalleryImages(data.images);
                     set({ images: sorted, allTags: deriveTags(sorted), galleryLoaded: true });
                     console.log(`📦 Reloaded ${data.images.length} images from server`);
                 } catch (e) {
@@ -461,29 +472,43 @@ export const useStore = create<AppState>()(
 
             updateImage: (id, updates) => {
                 console.log(`📝 updateImage called for ${id}`, updates);
+                let applied = false;
                 set((state) => {
+                    if (!state.images.some((img) => img.id === id)) {
+                        return state;
+                    }
+                    applied = true;
                     const images = state.images.map((img) =>
                         img.id === id ? { ...img, ...updates } : img
                     );
+                    const allTags = Array.isArray(updates.tags) ? deriveTags(images) : state.allTags;
                     return {
                         images,
-                        allTags: Array.isArray(updates.tags)
-                            ? mergeTagValues(state.allTags, updates.tags)
-                            : state.allTags,
+                        allTags,
+                        filters: Array.isArray(updates.tags)
+                            ? {
+                                ...state.filters,
+                                selectedTags: state.filters.selectedTags.filter((tag) => allTags.includes(tag)),
+                            }
+                            : state.filters,
                     };
                 });
+                if (!applied) {
+                    return false;
+                }
                 // Save to backend if updated to success status
                 const updated = get().images.find(img => img.id === id);
                 if (updated && updated.status === 'success') {
                     console.log(`💾 Saving to gallery: ${id}`);
                     saveToGallery(updated).catch(e => console.error('Failed to update image:', e));
                 }
+                return true;
             },
 
             removeImage: (id) => {
                 // Check if image was saved to backend before deleting
                 const image = get().images.find(img => img.id === id);
-                const wasSaved = image && image.status === 'success';
+                const wasSaved = image?.status === 'success';
                 const shouldDeleteLocal = get().deleteLocalFile;
 
                 console.log(`🗑️ removeImage called for ${id}, wasSaved=${wasSaved}, deleteLocal=${shouldDeleteLocal}`);
@@ -502,10 +527,27 @@ export const useStore = create<AppState>()(
                     };
                 });
 
-                // Only delete from backend if it was successfully saved
                 if (wasSaved) {
                     deleteFromGallery(id, shouldDeleteLocal).catch(e => console.error('Failed to delete image:', e));
                 }
+            },
+
+            removeImageLocalOnly: (id) => {
+                set((state) => {
+                    const images = state.images.filter((img) => img.id !== id);
+                    const allTags = deriveTags(images);
+                    return {
+                        images,
+                        allTags,
+                        selectedImageIds: state.selectedImageIds.filter((item) => item !== id),
+                        filters: {
+                            ...state.filters,
+                            selectedTags: state.filters.selectedTags.filter((tag) =>
+                                allTags.includes(tag)
+                            ),
+                        },
+                    };
+                });
             },
 
             toggleFavorite: (id) => {
@@ -689,20 +731,231 @@ export const useStore = create<AppState>()(
 
             // Uploads (NOT persisted)
             uploadedImages: [],
+            selectedReferenceIds: [],
             addUploadedImage: (image) => set((state) => ({
                 uploadedImages: [...state.uploadedImages, image]
             })),
-            removeUploadedImage: (id) => set((state) => {
+            updateUploadedImage: (id, updates) => set((state) => ({
+                uploadedImages: state.uploadedImages.map((img) => (
+                    img.id === id ? { ...img, ...updates } : img
+                )),
+            })),
+            removeUploadedImage: async (id) => {
+                const snapshot = get();
+                const removedImage = snapshot.uploadedImages.find((img) => img.id === id);
+                const wasSelected = snapshot.selectedReferenceIds.includes(id);
+
                 // Also clean up mask data when removing an uploaded image
-                const { [id]: _m, ...restMask } = state.maskData;
-                const { [id]: _f, ...restFeather } = state.maskFeather;
+                set((state) => {
+                    const { [id]: _m, ...restMask } = state.maskData;
+                    const { [id]: _f, ...restFeather } = state.maskFeather;
+                    return {
+                        uploadedImages: state.uploadedImages.filter((img) => img.id !== id),
+                        selectedReferenceIds: state.selectedReferenceIds.filter((item) => item !== id),
+                        maskData: restMask,
+                        maskFeather: restFeather,
+                    };
+                });
+
+                if (!removedImage?.refId) return;
+
+                try {
+                    await deleteReferenceImage(removedImage.refId);
+                } catch (deleteError) {
+                    set((state) => {
+                        if (state.uploadedImages.some((img) => img.id === id)) return {};
+                        return {
+                            uploadedImages: [...state.uploadedImages, removedImage],
+                            selectedReferenceIds: wasSelected
+                                ? Array.from(new Set([...state.selectedReferenceIds, id]))
+                                : state.selectedReferenceIds,
+                        };
+                    });
+                    throw deleteError;
+                }
+            },
+            clearUploadedImages: () => set({ uploadedImages: [], selectedReferenceIds: [], maskData: {}, maskFeather: {} }),
+            loadReferenceImagesFromServer: async (options = {}) => {
+                try {
+                    const limit = options.limit ?? 120;
+                    const offset = options.reset ? 0 : get().uploadedImages.filter((img) => img.refId).length;
+                    const { items: references, total } = await loadReferenceImages(limit, offset);
+                    set((state) => {
+                        const nextImages = state.uploadedImages.map((img) => ({ ...img }));
+                        for (const ref of references) {
+                            const restored = {
+                                id: ref.ref_id,
+                                name: ref.name,
+                                preview: ref.preview_url || ref.local_url,
+                                base64: ref.local_url,
+                                refId: ref.ref_id,
+                                localUrl: ref.local_url,
+                                publicUrl: ref.public_urls?.apimart?.url,
+                                contentType: ref.content_type,
+                                size: ref.size,
+                                status: 'ready' as const,
+                            };
+                            const existingIndex = nextImages.findIndex((img) => (
+                                img.refId === ref.ref_id || img.id === ref.ref_id
+                            ));
+                            if (existingIndex >= 0) {
+                                nextImages[existingIndex] = {
+                                    ...nextImages[existingIndex],
+                                    ...restored,
+                                    id: nextImages[existingIndex].id,
+                                };
+                            } else {
+                                nextImages.push(restored);
+                            }
+                        }
+                        const readyIds = new Set(
+                            nextImages
+                                .filter((img) => Boolean(img.refId || img.localUrl || img.publicUrl || img.base64) && (img.status || 'ready') === 'ready')
+                                .map((img) => img.id),
+                        );
+                        return {
+                            uploadedImages: nextImages,
+                            selectedReferenceIds: state.selectedReferenceIds.filter((id) => readyIds.has(id)),
+                        };
+                    });
+                    return { loaded: get().uploadedImages.filter((img) => img.refId).length, total };
+                } catch (error) {
+                    console.error('Failed to load reference library:', error);
+                    return { loaded: get().uploadedImages.filter((img) => img.refId).length, total: 0 };
+                }
+            },
+            uploadReferenceImages: async (files) => {
+                const fileArray = files.filter((file) => file.type.startsWith('image/'));
+                for (const file of fileArray) {
+                    const id = crypto.randomUUID();
+                    const preview = URL.createObjectURL(file);
+                    set((state) => ({
+                        uploadedImages: [
+                            ...state.uploadedImages,
+                            {
+                                id,
+                                file,
+                                name: file.name,
+                                preview,
+                                status: 'uploading',
+                            },
+                        ],
+                    }));
+
+                    try {
+                        const result = await uploadReferenceImage(file);
+                        set((state) => ({
+                            uploadedImages: state.uploadedImages.map((img) => (
+                                img.id === id
+                                    ? {
+                                        ...img,
+                                        base64: result.local_url,
+                                        refId: result.ref_id,
+                                        localUrl: result.local_url,
+                                        publicUrl: result.public_urls?.apimart?.url,
+                                        contentType: result.content_type,
+                                        size: result.size,
+                                        preview: result.preview_url || result.local_url,
+                                        status: 'ready' as const,
+                                        error: undefined,
+                                    }
+                                    : img
+                            )),
+                            selectedReferenceIds: Array.from(new Set([...state.selectedReferenceIds, id])),
+                        }));
+                    } catch (uploadError) {
+                        console.error('Upload to hosting failed:', uploadError);
+                        set((state) => ({
+                            uploadedImages: state.uploadedImages.map((img) => (
+                                img.id === id
+                                    ? {
+                                        ...img,
+                                        status: 'failed' as const,
+                                        error: uploadError instanceof Error ? uploadError.message : '图片上传失败，请重新上传。',
+                                    }
+                                    : img
+                            )),
+                            selectedReferenceIds: state.selectedReferenceIds.filter((item) => item !== id),
+                        }));
+                    }
+                }
+            },
+            addReferenceUrl: (url) => {
+                const id = crypto.randomUUID();
+                set((state) => ({
+                    uploadedImages: [
+                        ...state.uploadedImages,
+                        {
+                            id,
+                            name: 'remote-image',
+                            preview: url,
+                            base64: url,
+                            status: 'uploading',
+                        },
+                    ],
+                }));
+                importReferenceImageUrl(url)
+                    .then((result) => {
+                        set((state) => ({
+                            uploadedImages: state.uploadedImages.map((img) => (
+                                img.id === id
+                                    ? {
+                                        ...img,
+                                        id: result.ref_id,
+                                        name: result.name || 'remote-image',
+                                        preview: result.preview_url || result.local_url,
+                                        base64: result.local_url,
+                                        refId: result.ref_id,
+                                        localUrl: result.local_url,
+                                        publicUrl: result.public_urls?.apimart?.url,
+                                        contentType: result.content_type,
+                                        size: result.size,
+                                        status: 'ready' as const,
+                                        error: undefined,
+                                    }
+                                    : img
+                            )),
+                            selectedReferenceIds: Array.from(new Set([
+                                ...state.selectedReferenceIds.filter((item) => item !== id),
+                                result.ref_id,
+                            ])),
+                        }));
+                    })
+                    .catch((error) => {
+                        set((state) => ({
+                            uploadedImages: state.uploadedImages.map((img) => (
+                                img.id === id
+                                    ? {
+                                        ...img,
+                                        status: 'failed' as const,
+                                        error: error instanceof Error ? error.message : '远程参考图导入失败。',
+                                    }
+                                    : img
+                            )),
+                        }));
+                    });
+            },
+            setSelectedReferenceIds: (ids) => set((state) => {
+                const readyIds = new Set(
+                    state.uploadedImages
+                        .filter((img) => Boolean(img.refId || img.localUrl || img.publicUrl || img.base64) && (img.status || 'ready') === 'ready')
+                        .map((img) => img.id),
+                );
+                return { selectedReferenceIds: Array.from(new Set(ids.filter((id) => readyIds.has(id)))) };
+            }),
+            clearSelectedReferenceIds: () => set({ selectedReferenceIds: [] }),
+            toggleSelectedReferenceId: (id) => set((state) => {
+                const image = state.uploadedImages.find((img) => img.id === id);
+                if (!image || !Boolean(image.refId || image.localUrl || image.publicUrl || image.base64) || (image.status || 'ready') !== 'ready') {
+                    return {};
+                }
+                const exists = state.selectedReferenceIds.includes(id);
                 return {
-                    uploadedImages: state.uploadedImages.filter((img) => img.id !== id),
-                    maskData: restMask,
-                    maskFeather: restFeather,
+                    selectedReferenceIds: exists
+                        ? state.selectedReferenceIds.filter((item) => item !== id)
+                        : [...state.selectedReferenceIds, id],
                 };
             }),
-            clearUploadedImages: () => set({ uploadedImages: [], maskData: {}, maskFeather: {} }),
 
             // Mask data (NOT persisted — lives only in memory)
             maskData: {},

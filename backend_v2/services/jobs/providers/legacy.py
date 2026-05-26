@@ -38,16 +38,12 @@ class FlaskEndpointAdapter(ProviderAdapter):
         payload["_job_id"] = job["id"]
         payload["_job_provider"] = self.name
         store.update_job(job["id"], status="running", progress=5)
-        store.add_event(job["id"], "info", f"{self.name} 开始生成", self._event_payload(payload))
 
         response = self._call_endpoint(self.endpoint, payload, self.path)
         if not response.get("success", False):
             raise ProviderError(self._error_message(response, f"{self.name} generation failed"))
 
         results = self._normalize_images(response.get("data") or [], job["id"])
-        thought_images = response.get("thought_images") or []
-        if thought_images:
-            store.add_event(job["id"], "info", f"{self.name} 收到草图", {"count": len(thought_images)})
 
         store.update_job(job["id"], status="saving", progress=95, result_json=results)
         return results
@@ -95,16 +91,6 @@ class FlaskEndpointAdapter(ProviderAdapter):
             normalized.append(item)
         return normalized
 
-    def _event_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "model": payload.get("model"),
-            "size": payload.get("size") or payload.get("ratio"),
-            "quality": payload.get("quality"),
-            "resolution": payload.get("resolution"),
-            "n": payload.get("n"),
-            "refs": len(payload.get("image_urls") or []),
-        }
-
     def _error_message(self, payload: dict[str, Any], fallback: str) -> str:
         error = payload.get("error")
         if isinstance(error, dict) and error.get("message"):
@@ -140,7 +126,6 @@ class APIMartAdapter(FlaskEndpointAdapter):
     def run(self, job: dict[str, Any], store: JobStore) -> list[dict[str, Any]]:
         payload = self.normalize_payload(job)
         store.update_job(job["id"], status="running", progress=5)
-        store.add_event(job["id"], "info", "APIMart 提交任务", self._event_payload(payload))
 
         submitted = self._call_endpoint(self.submit_endpoint, payload, "/api/generate")
         task_id = self._extract_task_id(submitted)
@@ -150,7 +135,6 @@ class APIMartAdapter(FlaskEndpointAdapter):
             raise ProviderError(self._error_message(submitted, "APIMart did not return task_id"))
 
         store.update_job(job["id"], external_task_id=task_id, progress=10)
-        store.add_event(job["id"], "info", "APIMart 任务已提交", {"task_id": task_id})
 
         started_at = time.time()
         last_progress = None
@@ -170,12 +154,6 @@ class APIMartAdapter(FlaskEndpointAdapter):
 
             if progress != last_progress or normalized:
                 store.update_job(job["id"], status="running", progress=progress, result_json=normalized)
-                store.add_event(
-                    job["id"],
-                    "info",
-                    "APIMart 进度更新",
-                    {"task_id": task_id, "status": status, "progress": progress, "images": len(normalized)},
-                )
                 last_progress = progress
 
             if status in {"completed", "success", "succeeded"}:
@@ -253,7 +231,6 @@ class OpenAITaskAdapter(FlaskEndpointAdapter):
         if not task_ids:
             raise ProviderError("OpenAI did not return task ids")
         store.update_job(job["id"], external_task_id=",".join(task_ids), progress=10)
-        store.add_event(job["id"], "info", "ChatGPT2API 任务已提交", {"task_ids": task_ids})
 
         pending = set(task_ids)
         results: list[dict[str, Any]] = []
@@ -270,7 +247,6 @@ class OpenAITaskAdapter(FlaskEndpointAdapter):
                 pending.discard(str(missing_id))
                 failure = {"task_id": str(missing_id), "error": "任务不存在"}
                 failures.append(failure)
-                store.add_event(job["id"], "error", "ChatGPT2API 任务不存在", failure)
 
             for item in status_payload.get("data") or []:
                 task_id = str(item.get("task_id") or "")
@@ -281,7 +257,6 @@ class OpenAITaskAdapter(FlaskEndpointAdapter):
                     if not task_images:
                         failure = {"task_id": task_id, "error": "任务成功但没有返回图片"}
                         failures.append(failure)
-                        store.add_event(job["id"], "error", "ChatGPT2API 子任务无图片", failure)
                     for image in item.get("data") or []:
                         if isinstance(image, dict):
                             results.append(image)
@@ -290,7 +265,6 @@ class OpenAITaskAdapter(FlaskEndpointAdapter):
                     error = item.get("error")
                     failure = {"task_id": task_id, "error": error}
                     failures.append(failure)
-                    store.add_event(job["id"], "error", "ChatGPT2API 子任务失败", failure)
 
             progress = 100 if not pending else int(((len(task_ids) - len(pending)) / max(1, len(task_ids))) * 90) + 10
             normalized = self._normalize_images(results, job["id"])
@@ -302,13 +276,6 @@ class OpenAITaskAdapter(FlaskEndpointAdapter):
         if not normalized:
             summary = self._summarize_failures(failures)
             raise ProviderError(summary or "ChatGPT2API finished but produced 0 images")
-        if failures:
-            store.add_event(
-                job["id"],
-                "warn",
-                "ChatGPT2API 部分子任务失败",
-                {"failed": len(failures), "succeeded_images": len(normalized), "failures": failures[:5]},
-            )
         return normalized
 
     def _call_openai_status(self, task_ids: list[str]) -> dict[str, Any]:

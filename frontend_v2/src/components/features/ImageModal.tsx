@@ -10,7 +10,9 @@ import axios from 'axios';
 import { TransformWrapper, TransformComponent, useControls } from 'react-zoom-pan-pinch';
 import { colorWithAlpha, normalizeHexColor } from '../../utils/color';
 import { useProviders } from '../../hooks/useProviders';
-import { providerBadgeClass, providerLabel } from '../../utils/providers';
+import { providerBadgeClass, providerBadgeStyle, providerLabel } from '../../utils/providers';
+import { ReferenceImageStrip } from '../shared/ReferenceImageStrip';
+import { normalizePromptText } from '../../utils/prompt';
 
 const FALLBACK_TAG_COLOR = '#f43f5e';
 
@@ -153,6 +155,7 @@ export function ImageModal({ image: initialImage, onClose, images = [], onNaviga
         : naturalSize
             ? `${naturalSize.width}x${naturalSize.height}`
             : undefined;
+    const normalizedPrompt = normalizePromptText(image.prompt || '');
 
     // Build image URL - either use thumbnail URL, or use backend serve API
     const getImageSrc = () => {
@@ -160,7 +163,7 @@ export function ImageModal({ image: initialImage, onClose, images = [], onNaviga
     };
 
     const copyPrompt = () => {
-        navigator.clipboard.writeText(image.prompt);
+        navigator.clipboard.writeText(normalizedPrompt);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
     };
@@ -206,6 +209,12 @@ export function ImageModal({ image: initialImage, onClose, images = [], onNaviga
 
     useEffect(() => {
         const handler = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                onClose();
+                return;
+            }
+
             const target = event.target as HTMLElement | null;
             const tagName = target?.tagName?.toLowerCase();
             if (tagName === 'input' || tagName === 'textarea' || target?.isContentEditable) return;
@@ -221,7 +230,7 @@ export function ImageModal({ image: initialImage, onClose, images = [], onNaviga
 
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [nextImage, previousImage]);
+    }, [nextImage, onClose, previousImage]);
 
     useEffect(() => {
         [previousImage, nextImage].forEach((item) => {
@@ -383,7 +392,7 @@ export function ImageModal({ image: initialImage, onClose, images = [], onNaviga
                                 </button>
                             </div>
                             <p className="text-sm text-[var(--text-primary)] bg-[var(--bg-secondary)] rounded-lg p-3 max-h-40 overflow-y-auto">
-                                {image.prompt}
+                                {normalizedPrompt}
                             </p>
                         </div>
 
@@ -440,7 +449,10 @@ export function ImageModal({ image: initialImage, onClose, images = [], onNaviga
                         <div className="space-y-2 text-sm">
                             <div className="flex justify-between">
                                 <span className="text-[var(--text-muted)]">API</span>
-                                <span className={`px-2 py-0.5 rounded text-xs ${providerBadgeClass(image.apiType)}`}>
+                                <span
+                                    className={`px-2 py-0.5 rounded text-xs ${providerBadgeClass(image.apiType)}`}
+                                    style={providerBadgeStyle(image.apiType, providers)}
+                                >
                                     {providerLabel(image.apiType, providers)}
                                 </span>
                             </div>
@@ -527,6 +539,12 @@ export function ImageModal({ image: initialImage, onClose, images = [], onNaviga
                                     </span>
                                 </div>
                             )}
+                            <div className="flex items-start justify-between gap-3">
+                                <span className="pt-1 text-[var(--text-muted)]">参考图</span>
+                                <div className="flex max-w-[11.5rem] justify-end">
+                                    <ReferenceImageStrip images={image.inputImages} max={6} size="sm" emptyText="无" />
+                                </div>
+                            </div>
                         </div>
 
                         {/* File path */}

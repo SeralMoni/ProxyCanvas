@@ -3,7 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 import time
-import traceback
 from typing import Any
 
 from services.jobs.providers import ProviderAdapter, ProviderTimeout, SousakuAdapter
@@ -89,21 +88,17 @@ class JobWorker:
             if not adapter:
                 raise ValueError(f"unknown job provider: {provider}")
 
-            self.store.add_event(job_id, "info", "Worker 开始执行", {"provider": provider})
             self._log("JOB", "开始执行", "INFO", job=job_id[:12], provider=provider)
             result = adapter.run(job, self.store)
             self.store.finish_job(job_id, "succeeded", result=result)
             requested = _requested_image_count(job)
             succeeded = len(result)
-            self.store.add_event(job_id, "info", "任务成功", {"images": succeeded, "requested": requested})
             self._log("JOB", "任务完成", "OK", job=job_id[:12], provider=provider, images=f"{succeeded}/{requested}")
         except ProviderTimeout as exc:
             self.store.finish_job(job_id, "timeout", error=str(exc))
-            self.store.add_event(job_id, "error", "任务超时", {"error": str(exc)})
             self._log("JOB", "任务超时", "ERROR", job=job_id[:12], provider=provider, error=exc)
         except Exception as exc:
             self.store.finish_job(job_id, "failed", error=str(exc))
-            self.store.add_event(job_id, "error", "任务失败", {"error": str(exc), "traceback": traceback.format_exc(limit=8)})
             self._log("JOB", "任务失败", "ERROR", job=job_id[:12], provider=provider, error=exc)
         finally:
             with self._lock:

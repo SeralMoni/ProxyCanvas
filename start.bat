@@ -18,8 +18,9 @@ rem Optional external service: CLIProxyAPI.
 rem Leave CLIPROXY_DIR empty to skip it.
 rem Example:
 rem set "CLIPROXY_DIR=D:\apps\CLIProxyAPI"
-set "CLIPROXY_DIR="
+set "CLIPROXY_DIR=F:\CLIProxyAPI_6.10.9_windows_amd64"
 set "CLIPROXY_EXE=cli-proxy-api.exe"
+set "CLIPROXY_CMD=go run ./cmd/server"
 
 rem Optional external service: ChatGPT2API.
 rem Leave CHATGPT2API_DIR empty to skip it.
@@ -29,9 +30,9 @@ rem set "CHATGPT2API_CONDA_ENV=my_env"
 rem set "CHATGPT2API_CMD=python -u main.py"
 rem If your ChatGPT2API project uses uv, you can use:
 rem set "CHATGPT2API_CMD=uv run main.py"
-set "CHATGPT2API_DIR="
-set "CHATGPT2API_CONDA_ENV="
-set "CHATGPT2API_CMD=python -u main.py"
+set "CHATGPT2API_DIR=F:\CodeProject\chatgpt2api"
+set "CHATGPT2API_CONDA_ENV=zimg"
+set "CHATGPT2API_CMD=python -m uvicorn main:app --host 127.0.0.1 --port 8010 --no-access-log --log-level info"
 
 set "BACKEND_DIR=%~dp0backend_v2"
 set "FRONTEND_DIR=%~dp0frontend_v2"
@@ -40,8 +41,11 @@ if defined CLIPROXY_DIR (
     if exist "%CLIPROXY_DIR%\%CLIPROXY_EXE%" (
         echo Starting CLIProxyAPI...
         start "CLIProxyAPI" cmd /k "cd /d ""%CLIPROXY_DIR%"" && %CLIPROXY_EXE%"
+    ) else if exist "%CLIPROXY_DIR%\cmd\server\main.go" (
+        echo Starting CLIProxyAPI...
+        start "CLIProxyAPI" cmd /k "cd /d ""%CLIPROXY_DIR%"" && %CLIPROXY_CMD%"
     ) else (
-        echo CLIProxyAPI path not found, skipped: %CLIPROXY_DIR%\%CLIPROXY_EXE%
+        echo CLIProxyAPI path not found, skipped: %CLIPROXY_DIR%
     )
 ) else (
     echo CLIProxyAPI path is not configured, skipped.

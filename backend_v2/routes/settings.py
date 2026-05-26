@@ -8,6 +8,7 @@ from flask import Blueprint, jsonify, request
 
 import config
 from services import provider_registry
+from services.storage_usage import clear_cache, storage_usage
 
 
 settings_bp = Blueprint("settings", __name__)
@@ -20,6 +21,13 @@ def _path_value(path: str | os.PathLike[str], source: str = "config.py") -> dict
     except Exception:
         resolved = raw
     return {"value": raw, "resolved": resolved, "source": source}
+
+
+def _display_config_path(path: str | os.PathLike[str]) -> str:
+    try:
+        return Path(path).resolve().relative_to(Path(config.PROJECT_ROOT).resolve()).as_posix()
+    except Exception:
+        return str(path)
 
 
 def _read_app_settings() -> dict[str, Any]:
@@ -107,15 +115,22 @@ def get_settings():
                 "maxWorkers": _setting(app_settings["jobs"]["maxWorkers"], raw_app_settings, "jobs", "maxWorkers"),
                 "pollIntervalSeconds": _setting(app_settings["jobs"]["pollIntervalSeconds"], raw_app_settings, "jobs", "pollIntervalSeconds"),
                 "defaultTimeoutSeconds": _setting(app_settings["jobs"]["defaultTimeoutSeconds"], raw_app_settings, "jobs", "defaultTimeoutSeconds"),
+                "sousakuStaleTaskSeconds": _setting(app_settings["jobs"]["sousakuStaleTaskSeconds"], raw_app_settings, "jobs", "sousakuStaleTaskSeconds"),
                 "providerLimits": _setting(app_settings["jobs"]["providerLimits"], raw_app_settings, "jobs", "providerLimits"),
             },
             "network": {
                 "httpProxies": _setting(app_settings["network"]["httpProxies"], raw_app_settings, "network", "httpProxies"),
+                "publicUrlTtlSeconds": _setting(app_settings["network"]["publicUrlTtlSeconds"], raw_app_settings, "network", "publicUrlTtlSeconds"),
+            },
+            "logging": {
+                "level": _setting(app_settings["logging"]["level"], raw_app_settings, "logging", "level"),
+                "color": _setting(app_settings["logging"]["color"], raw_app_settings, "logging", "color"),
+                "sousakuProgressPanel": _setting(app_settings["logging"]["sousakuProgressPanel"], raw_app_settings, "logging", "sousakuProgressPanel"),
             },
             "configFiles": {
                 "appSettings": {"path": "config/app_settings.json", "exists": APP_SETTINGS_PATH.exists()},
                 "providers": {"path": "config/providers.json", "exists": PROVIDERS_SETTINGS_PATH.exists()},
-                "sousaku": {"path": config.SOUSAKU_CONFIG_PATH, "exists": Path(config.SOUSAKU_CONFIG_PATH).exists()},
+                "sousaku": {"path": _display_config_path(config.SOUSAKU_CONFIG_PATH), "exists": Path(config.SOUSAKU_CONFIG_PATH).exists()},
             },
         },
     })
@@ -140,9 +155,40 @@ def reset_settings():
     return jsonify({"success": True, "data": defaults})
 
 
+@settings_bp.route("/api/storage/usage", methods=["GET"])
+def get_storage_usage():
+    try:
+        return jsonify({"success": True, "data": storage_usage()})
+    except Exception as exc:
+        return jsonify({"success": False, "error": {"message": str(exc)}}), 500
+
+
+@settings_bp.route("/api/storage/cache/<cache_name>/clear", methods=["POST"])
+def clear_storage_cache(cache_name: str):
+    try:
+        return jsonify({"success": True, "data": clear_cache(cache_name)})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": {"message": str(exc)}}), 400
+    except Exception as exc:
+        return jsonify({"success": False, "error": {"message": str(exc)}}), 500
+
+
 @settings_bp.route("/api/providers", methods=["GET"])
 def get_providers():
     return jsonify({"success": True, "data": provider_registry.list_providers()})
+
+
+@settings_bp.route("/api/providers", methods=["POST"])
+def create_provider():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"success": False, "error": {"message": "Invalid provider payload"}}), 400
+
+    try:
+        created = provider_registry.create_provider(payload)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": {"message": str(exc)}}), 400
+    return jsonify({"success": True, "data": created}), 201
 
 
 @settings_bp.route("/api/providers/<provider_id>", methods=["PATCH"])
@@ -156,3 +202,14 @@ def update_provider(provider_id: str):
     except KeyError:
         return jsonify({"success": False, "error": {"message": "Provider not found"}}), 404
     return jsonify({"success": True, "data": updated})
+
+
+@settings_bp.route("/api/providers/<provider_id>", methods=["DELETE"])
+def delete_provider(provider_id: str):
+    try:
+        provider_registry.delete_provider(provider_id)
+    except KeyError:
+        return jsonify({"success": False, "error": {"message": "Provider not found"}}), 404
+    except ValueError as exc:
+        return jsonify({"success": False, "error": {"message": str(exc)}}), 400
+    return jsonify({"success": True})

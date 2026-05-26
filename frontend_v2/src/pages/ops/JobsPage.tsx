@@ -1,8 +1,9 @@
-import { Copy, Eye, Search, Trash2 } from 'lucide-react';
+import { Copy, Eye, Search, Trash2, X } from 'lucide-react';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { deleteGenerationJob, deleteGenerationJobs, listGenerationJobs, type GenerationJob } from '../../services/api';
+import { checkGenerationJob, deleteGenerationJob, deleteGenerationJobs, listGenerationJobs, type GenerationJob } from '../../services/api';
 import { useProviders } from '../../hooks/useProviders';
 import { providerLabel } from '../../utils/providers';
+import { ReferenceImageStrip } from '../../components/shared/ReferenceImageStrip';
 
 const statusLabels: Record<string, string> = {
     queued: '排队',
@@ -25,6 +26,28 @@ const statusClass: Record<string, string> = {
     cancelled: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
     timeout: 'bg-orange-500/15 text-orange-300 border-orange-500/30',
 };
+
+const statusDotClass: Record<string, string> = {
+    queued: 'bg-zinc-400',
+    submitting: 'bg-sky-400',
+    running: 'bg-blue-400',
+    saving: 'bg-teal-400',
+    succeeded: 'bg-emerald-400',
+    failed: 'bg-rose-400',
+    cancelled: 'bg-amber-400',
+    timeout: 'bg-orange-400',
+};
+
+function StatusText({ status }: { status: string }) {
+    return (
+        <span className="inline-flex items-center gap-2 whitespace-nowrap text-xs font-medium">
+            <span className={`h-2 w-2 rounded-full ${statusDotClass[status] || statusDotClass.queued}`} />
+            <span className={statusClass[status]?.split(' ').find((item) => item.startsWith('text-')) || 'text-zinc-300'}>
+                {statusLabels[status] || status}
+            </span>
+        </span>
+    );
+}
 
 function fmtTime(value?: string) {
     if (!value) return '-';
@@ -57,6 +80,29 @@ function referenceCount(job: GenerationJob) {
     return Array.isArray(inline) ? inline.length : 0;
 }
 
+function mergeJobListUpdates(nextJobs: GenerationJob[], currentJobs: GenerationJob[]) {
+    const currentById = new Map(currentJobs.map((job) => [job.id, job]));
+    return nextJobs.map((nextJob) => {
+        const currentJob = currentById.get(nextJob.id);
+        if (!currentJob) {
+            return nextJob;
+        }
+        return {
+            ...currentJob,
+            status: nextJob.status,
+            progress: nextJob.progress,
+            result: nextJob.result,
+            error: nextJob.error,
+            external_task_id: nextJob.external_task_id,
+            attempts: nextJob.attempts,
+            max_attempts: nextJob.max_attempts,
+            updated_at: nextJob.updated_at,
+            started_at: nextJob.started_at,
+            finished_at: nextJob.finished_at,
+        };
+    });
+}
+
 function resultImageUrl(image: Record<string, unknown> | undefined) {
     if (!image) return null;
     const localPath = image.saved_path as string | undefined;
@@ -65,6 +111,13 @@ function resultImageUrl(image: Record<string, unknown> | undefined) {
 
 function isActiveJob(job: GenerationJob) {
     return ['queued', 'submitting', 'running', 'saving'].includes(job.status);
+}
+
+function sortJobsByCreatedAt(jobs: GenerationJob[]) {
+    return [...jobs].sort((left, right) => {
+        const byCreatedAt = new Date(right.created_at).getTime() - new Date(left.created_at).getTime();
+        return byCreatedAt || right.id.localeCompare(left.id);
+    });
 }
 
 export function JobsPage() {
@@ -77,6 +130,7 @@ export function JobsPage() {
     const [pageSize, setPageSize] = useState(50);
     const [detailTop, setDetailTop] = useState(0);
     const [selectedResultIndex, setSelectedResultIndex] = useState(0);
+    const [errorDialogJob, setErrorDialogJob] = useState<GenerationJob | null>(null);
     const pageRef = useRef<HTMLElement>(null);
     const listPanelRef = useRef<HTMLDivElement>(null);
     const detailRef = useRef<HTMLDivElement>(null);
@@ -94,8 +148,8 @@ export function JobsPage() {
         try {
             const response = await listGenerationJobs({ limit: 200 });
             if (response.success) {
-                const nextJobs = response.data || [];
-                setJobs(nextJobs);
+                const nextJobs = sortJobsByCreatedAt(response.data || []);
+                setJobs((currentJobs) => mergeJobListUpdates(nextJobs, currentJobs));
                 setSelectedId((currentId) => {
                     if (currentId && nextJobs.some((job) => job.id === currentId)) {
                         return currentId;
@@ -154,6 +208,18 @@ export function JobsPage() {
             setSelectedId(pagedJobs[0].id);
         }
     }, [pagedJobs, selectedId]);
+
+    useEffect(() => {
+        if (!selectedId) return;
+        let cancelled = false;
+        checkGenerationJob(selectedId).then((response) => {
+            if (cancelled || !response.success || !response.data) return;
+            setJobs((items) => items.map((job) => (job.id === selectedId ? { ...job, ...response.data } : job)));
+        }).catch(() => undefined);
+        return () => {
+            cancelled = true;
+        };
+    }, [selectedId]);
 
     const selected = pagedJobs.find((job) => job.id === selectedId) || pagedJobs[0];
     const selectedResults = Array.isArray(selected?.result) ? selected.result : [];
@@ -274,18 +340,18 @@ export function JobsPage() {
                 </div>
 
                 <div className="overflow-auto">
-                    <table className="w-full min-w-[980px] text-left text-sm">
+                    <table className="w-full min-w-[980px] table-fixed text-left text-sm">
                         <thead className="sticky top-0 z-10 bg-[var(--bg-secondary)] text-xs text-[var(--text-muted)]">
                             <tr>
-                                <th className="px-4 py-3 font-medium">任务</th>
-                                <th className="px-3 py-3 font-medium">渠道</th>
-                                <th className="px-3 py-3 font-medium">状态</th>
-                                <th className="px-3 py-3 font-medium">进度</th>
-                                <th className="px-3 py-3 font-medium">模型</th>
-                                <th className="px-3 py-3 font-medium">数量</th>
-                                <th className="px-3 py-3 font-medium">耗时</th>
-                                <th className="px-3 py-3 font-medium">创建时间</th>
-                                <th className="px-3 py-3 font-medium">操作</th>
+                                <th className="w-[26%] px-4 py-3 font-medium">任务</th>
+                                <th className="w-[12%] px-3 py-3 font-medium">渠道</th>
+                                <th className="w-[8%] px-3 py-3 font-medium">状态</th>
+                                <th className="w-[14%] px-3 py-3 font-medium">进度</th>
+                                <th className="w-[11%] px-3 py-3 font-medium">模型</th>
+                                <th className="w-[6%] px-3 py-3 font-medium">数量</th>
+                                <th className="w-[6%] px-3 py-3 font-medium">耗时</th>
+                                <th className="w-[10%] px-3 py-3 font-medium">创建时间</th>
+                                <th className="w-[7%] px-3 py-3 font-medium">操作</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -293,27 +359,25 @@ export function JobsPage() {
                                 <tr
                                     key={job.id}
                                     onClick={(event) => selectJobAtRow(job.id, event.currentTarget)}
-                                    className={`cursor-pointer border-b border-[var(--border-subtle)] transition-colors hover:bg-[var(--bg-card-hover)] ${selected?.id === job.id ? 'bg-rose-500/8' : ''}`}
+                                    className={`cursor-pointer border-b border-[var(--border-subtle)] transition-colors hover:bg-[var(--bg-card-hover)] ${selected?.id === job.id ? 'bg-[var(--accent-primary)]/12 shadow-[inset_3px_0_0_var(--accent-primary)]' : ''}`}
                                 >
                                     <td className="max-w-[360px] px-4 py-3">
                                         <div className="font-mono text-xs text-[var(--text-muted)]">{job.id.slice(0, 12)}</div>
                                         <div className="truncate text-[var(--text-primary)]">{job.prompt || '无 Prompt'}</div>
                                     </td>
-                                    <td className="px-3 py-3 text-[var(--text-secondary)]">{providerLabel(job.provider, providers)}</td>
+                                    <td className="truncate px-3 py-3 text-[var(--text-secondary)]">{providerLabel(job.provider, providers)}</td>
                                     <td className="px-3 py-3">
-                                        <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${statusClass[job.status] || statusClass.queued}`}>
-                                            {statusLabels[job.status] || job.status}
-                                        </span>
+                                        <StatusText status={job.status} />
                                     </td>
                                     <td className="px-3 py-3">
                                         <div className="flex items-center gap-2">
-                                            <div className="h-1.5 w-24 overflow-hidden rounded-full bg-zinc-800">
+                                            <div className="h-1.5 w-20 overflow-hidden rounded-full bg-zinc-800">
                                                 <div className="h-full rounded-full bg-[var(--accent-primary)]" style={{ width: `${Math.min(100, job.progress || 0)}%` }} />
                                             </div>
                                             <span className="w-9 text-xs text-[var(--text-muted)]">{job.progress || 0}%</span>
                                         </div>
                                     </td>
-                                    <td className="px-3 py-3 text-[var(--text-secondary)]">{String(job.params?.model || '-')}</td>
+                                    <td className="truncate px-3 py-3 text-[var(--text-secondary)]">{String(job.params?.model || '-')}</td>
                                     <td className="px-3 py-3 text-[var(--text-secondary)]">
                                         <span className="font-mono text-xs">
                                             {resultCount(job)}/{requestedCount(job)}
@@ -435,15 +499,36 @@ export function JobsPage() {
                                     ['模型', String(selected.params?.model || '-')],
                                     ['比例', String(selected.params?.size || selected.params?.ratio || '-')],
                                     ['数量', `${resultCount(selected)}/${requestedCount(selected)}`],
-                                    ['参考图', `${referenceCount(selected)} 张`],
                                     ['Provider任务ID', selected.external_task_id || '-'],
-                                    ['失败原因', selected.error || '-'],
                                 ].map(([label, value]) => (
                                     <div key={label} className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-3">
                                         <div className="text-xs text-[var(--text-muted)]">{label}</div>
                                         <div className="mt-1 truncate text-[var(--text-primary)]">{value}</div>
                                     </div>
                                 ))}
+                                <button
+                                    type="button"
+                                    disabled={!selected.error}
+                                    onClick={() => setErrorDialogJob(selected)}
+                                    className="col-span-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-3 text-left transition-colors enabled:hover:border-rose-400/45 enabled:hover:bg-rose-500/8 disabled:cursor-default"
+                                >
+                                    <div className="flex items-center justify-between gap-3">
+                                        <div className="text-xs text-[var(--text-muted)]">失败原因</div>
+                                        {selected.error && <span className="text-xs text-rose-300">查看完整</span>}
+                                    </div>
+                                    <div className={`mt-1 line-clamp-2 break-words text-[var(--text-primary)] ${selected.error ? 'text-rose-100/90' : ''}`}>
+                                        {selected.error || '-'}
+                                    </div>
+                                </button>
+                            </section>
+                            <section>
+                                <div className="mb-2 flex items-center justify-between gap-3">
+                                    <div className="text-xs font-medium text-[var(--text-muted)]">参考图</div>
+                                    <div className="text-xs text-[var(--text-muted)]">{referenceCount(selected)} 张</div>
+                                </div>
+                                <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-3">
+                                    <ReferenceImageStrip images={selected.input_images} max={12} />
+                                </div>
                             </section>
                             <section>
                                 <div className="mb-2 text-xs font-medium text-[var(--text-muted)]">结果预览</div>
@@ -467,24 +552,6 @@ export function JobsPage() {
                                     {!selected.result?.length && <div className="col-span-2 rounded-lg border border-dashed border-[var(--border-subtle)] p-6 text-center text-sm text-[var(--text-muted)]">暂无结果</div>}
                                 </div>
                             </section>
-                            <section>
-                                <div className="mb-2 text-xs font-medium text-[var(--text-muted)]">事件日志</div>
-                                <div className="space-y-2">
-                                    {(selected.events || []).map((event: any) => (
-                                        <div key={event.id} className="rounded-lg bg-[var(--bg-secondary)] p-3 text-xs">
-                                            <div className="flex items-center justify-between text-[var(--text-muted)]">
-                                                <span>{event.level}</span>
-                                                <span>{fmtTime(event.created_at)}</span>
-                                            </div>
-                                            <div className="mt-1 text-[var(--text-secondary)]">{event.message}</div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </section>
-                            <button className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]">
-                                <Copy className="h-4 w-4" />
-                                复制任务参数
-                            </button>
                         </div>
                     </div>
                 ) : (
@@ -496,6 +563,51 @@ export function JobsPage() {
                     </div>
                 )}
             </aside>
+            {errorDialogJob?.error && (
+                <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm" onClick={() => setErrorDialogJob(null)}>
+                    <div
+                        className="w-full max-w-3xl overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] shadow-2xl"
+                        onClick={(event) => event.stopPropagation()}
+                    >
+                        <div className="flex items-start justify-between gap-4 border-b border-[var(--border-subtle)] p-4">
+                            <div>
+                                <div className="text-lg font-semibold text-[var(--text-primary)]">失败原因</div>
+                                <div className="mt-1 font-mono text-xs text-[var(--text-muted)]">{errorDialogJob.id}</div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setErrorDialogJob(null)}
+                                className="rounded-lg p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-secondary)] hover:text-[var(--text-primary)]"
+                                aria-label="关闭"
+                            >
+                                <X className="h-4 w-4" />
+                            </button>
+                        </div>
+                        <div className="max-h-[65vh] overflow-auto p-4">
+                            <pre className="whitespace-pre-wrap break-words rounded-lg border border-rose-500/20 bg-rose-500/8 p-4 font-mono text-xs leading-relaxed text-rose-100/90">
+                                {errorDialogJob.error}
+                            </pre>
+                        </div>
+                        <div className="flex justify-end gap-2 border-t border-[var(--border-subtle)] p-4">
+                            <button
+                                type="button"
+                                onClick={() => void navigator.clipboard?.writeText(errorDialogJob.error || '')}
+                                className="inline-flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-secondary)] hover:text-[var(--text-primary)]"
+                            >
+                                <Copy className="h-4 w-4" />
+                                复制
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setErrorDialogJob(null)}
+                                className="rounded-lg bg-[var(--accent-primary)] px-3 py-2 text-sm text-white transition-opacity hover:opacity-90"
+                            >
+                                关闭
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </section>
     );
 }

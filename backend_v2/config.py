@@ -54,6 +54,7 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         "maxWorkers": 36,
         "pollIntervalSeconds": 3,
         "defaultTimeoutSeconds": 30 * 60,
+        "sousakuStaleTaskSeconds": 30 * 60,
         "providerLimits": {
             "sousaku": 20,
             "cliproxy": 6,
@@ -68,6 +69,12 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
             "http": "http://127.0.0.1:7890",
             "https": "http://127.0.0.1:7890",
         },
+        "publicUrlTtlSeconds": 90 * 60,
+    },
+    "logging": {
+        "level": "INFO",
+        "color": True,
+        "sousakuProgressPanel": True,
     },
     "advanced": {
         "nanobanana2JailbreakEnabled": True,
@@ -150,7 +157,7 @@ DEFAULT_PROVIDERS_SETTINGS: dict[str, Any] = {
             "label": "ChatGPT2API",
             "type": "openai-compatible",
             "enabled": True,
-            "baseUrl": "http://127.0.0.1:8000/v1",
+            "baseUrl": "http://127.0.0.1:8010/v1",
             "apiKey": "chatgpt2api",
             "defaultModel": "gpt-image-2",
             "models": [
@@ -468,6 +475,12 @@ def normalized_app_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]
     jobs["maxWorkers"] = _int_value(jobs.get("maxWorkers"), DEFAULT_APP_SETTINGS["jobs"]["maxWorkers"], minimum=1, maximum=128)
     jobs["pollIntervalSeconds"] = _int_value(jobs.get("pollIntervalSeconds"), DEFAULT_APP_SETTINGS["jobs"]["pollIntervalSeconds"], minimum=1, maximum=60)
     jobs["defaultTimeoutSeconds"] = _int_value(jobs.get("defaultTimeoutSeconds"), DEFAULT_APP_SETTINGS["jobs"]["defaultTimeoutSeconds"], minimum=60, maximum=24 * 60 * 60)
+    jobs["sousakuStaleTaskSeconds"] = _int_value(
+        jobs.get("sousakuStaleTaskSeconds"),
+        DEFAULT_APP_SETTINGS["jobs"]["sousakuStaleTaskSeconds"],
+        minimum=60,
+        maximum=24 * 60 * 60,
+    )
     limits = jobs.get("providerLimits")
     if not isinstance(limits, dict):
         limits = DEFAULT_APP_SETTINGS["jobs"]["providerLimits"]
@@ -478,6 +491,25 @@ def normalized_app_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]
 
     proxies = network.get("httpProxies")
     network["httpProxies"] = proxies if isinstance(proxies, dict) else None
+    network["publicUrlTtlSeconds"] = _int_value(
+        network.get("publicUrlTtlSeconds"),
+        DEFAULT_APP_SETTINGS["network"]["publicUrlTtlSeconds"],
+        minimum=60,
+        maximum=24 * 60 * 60,
+    )
+    network.pop("referenceCache", None)
+
+    logging_settings = data.get("logging")
+    if not isinstance(logging_settings, dict):
+        logging_settings = {}
+    data["logging"] = logging_settings
+    level = str(logging_settings.get("level") or DEFAULT_APP_SETTINGS["logging"]["level"]).upper()
+    logging_settings["level"] = level if level in {"DEBUG", "INFO", "OK", "WARN", "ERROR"} else DEFAULT_APP_SETTINGS["logging"]["level"]
+    logging_settings["color"] = _bool_value(logging_settings.get("color"), DEFAULT_APP_SETTINGS["logging"]["color"])
+    logging_settings["sousakuProgressPanel"] = _bool_value(
+        logging_settings.get("sousakuProgressPanel"),
+        DEFAULT_APP_SETTINGS["logging"]["sousakuProgressPanel"],
+    )
 
     advanced["nanobanana2JailbreakEnabled"] = _bool_value(
         advanced.get("nanobanana2JailbreakEnabled"),
@@ -503,6 +535,7 @@ def normalized_providers_settings(raw: dict[str, Any] | None = None) -> dict[str
         defaults = DEFAULT_PROVIDERS_SETTINGS["providers"].get(provider_id, {})
         provider["label"] = str(provider.get("label") or defaults.get("label") or provider_id)
         provider["type"] = str(provider.get("type") or defaults.get("type") or "openai-compatible")
+        provider["protocol"] = str(provider.get("protocol") or defaults.get("protocol") or ("chat-completions" if provider["type"] == "chat-completions" else "images"))
         provider["enabled"] = _bool_value(provider.get("enabled"), defaults.get("enabled", True))
         provider["baseUrl"] = str(provider.get("baseUrl") or defaults.get("baseUrl") or "")
         provider["apiKey"] = str(provider.get("apiKey") or defaults.get("apiKey") or "")
@@ -514,6 +547,15 @@ def normalized_providers_settings(raw: dict[str, Any] | None = None) -> dict[str
         capabilities = provider.get("capabilities", defaults.get("capabilities", []))
         provider["capabilities"] = [str(item) for item in capabilities] if isinstance(capabilities, list) else []
         provider["notes"] = str(provider.get("notes") or defaults.get("notes") or "")
+        provider["stream"] = _bool_value(provider.get("stream"), defaults.get("stream", False))
+        provider["timeoutSeconds"] = _int_value(provider.get("timeoutSeconds"), int(defaults.get("timeoutSeconds") or 1200), minimum=30, maximum=24 * 60 * 60)
+        provider["badgeColor"] = _hex_color(provider.get("badgeColor"), defaults.get("badgeColor", "#8ecae6"))
+        if provider.get("endpointPath") or defaults.get("endpointPath"):
+            provider["endpointPath"] = str(provider.get("endpointPath") or defaults.get("endpointPath") or "")
+        if provider.get("responseFormat") or defaults.get("responseFormat"):
+            provider["responseFormat"] = str(provider.get("responseFormat") or defaults.get("responseFormat") or "")
+        if provider.get("imageAction") or defaults.get("imageAction"):
+            provider["imageAction"] = str(provider.get("imageAction") or defaults.get("imageAction") or "")
         if provider["type"] == "sousaku":
             provider["configPath"] = str(provider.get("configPath") or defaults.get("configPath") or "config/sousaku_config.json")
     return data
@@ -583,8 +625,10 @@ def apply_runtime_config() -> None:
     global GALLERY_COLUMNS, GALLERY_DISPLAY_MODE, GALLERY_PAGE_SIZE
     global GALLERY_DELETE_LOCAL_FILE, GALLERY_DELETE_IMPORTED_ORIGINAL
     global AUTO_CLEAR_PROMPT, GALLERY_SELECTION_COLOR, GALLERY_SELECTION_BOX_COLOR, GALLERY_TAG_COLOR
-    global JOB_WORKER_ENABLED, JOB_WORKER_MAX_WORKERS, JOB_POLL_INTERVAL_SECONDS, JOB_DEFAULT_TIMEOUT_SECONDS, JOB_PROVIDER_LIMITS
-    global HTTP_PROXIES, ENABLE_NANOBANANA2_JAILBREAK, NANOBANANA2_JAILBREAK_PROMPT
+    global JOB_WORKER_ENABLED, JOB_WORKER_MAX_WORKERS, JOB_POLL_INTERVAL_SECONDS, JOB_DEFAULT_TIMEOUT_SECONDS, SOUSAKU_STALE_TASK_SECONDS, JOB_PROVIDER_LIMITS
+    global HTTP_PROXIES, PUBLIC_URL_TTL_SECONDS
+    global LOG_LEVEL, LOG_COLOR, SOUSAKU_PROGRESS_PANEL
+    global ENABLE_NANOBANANA2_JAILBREAK, NANOBANANA2_JAILBREAK_PROMPT
     global API_KEY, API_BASE_URL, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_IMAGE_MODEL
     global NANOBANANA2_API_KEY, NANOBANANA2_BASE_URL, CLIPROXY_API_KEY, CLIPROXY_BASE_URL, SOUSAKU_CONFIG_PATH
 
@@ -617,9 +661,14 @@ def apply_runtime_config() -> None:
     JOB_WORKER_MAX_WORKERS = APP_SETTINGS["jobs"]["maxWorkers"]
     JOB_POLL_INTERVAL_SECONDS = APP_SETTINGS["jobs"]["pollIntervalSeconds"]
     JOB_DEFAULT_TIMEOUT_SECONDS = APP_SETTINGS["jobs"]["defaultTimeoutSeconds"]
+    SOUSAKU_STALE_TASK_SECONDS = APP_SETTINGS["jobs"]["sousakuStaleTaskSeconds"]
     JOB_PROVIDER_LIMITS = APP_SETTINGS["jobs"]["providerLimits"]
 
     HTTP_PROXIES = APP_SETTINGS["network"]["httpProxies"]
+    PUBLIC_URL_TTL_SECONDS = APP_SETTINGS["network"]["publicUrlTtlSeconds"]
+    LOG_LEVEL = APP_SETTINGS["logging"]["level"]
+    LOG_COLOR = APP_SETTINGS["logging"]["color"]
+    SOUSAKU_PROGRESS_PANEL = APP_SETTINGS["logging"]["sousakuProgressPanel"]
     ENABLE_NANOBANANA2_JAILBREAK = APP_SETTINGS["advanced"]["nanobanana2JailbreakEnabled"]
     NANOBANANA2_JAILBREAK_PROMPT = APP_SETTINGS["advanced"]["nanobanana2JailbreakPrompt"]
 

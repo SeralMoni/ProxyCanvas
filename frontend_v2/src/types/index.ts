@@ -10,12 +10,23 @@ export interface ImageItem {
     width?: number;
     height?: number;
     prompt: string;
-    apiType: 'apimart' | 'openai' | 'nanobanana2' | 'cliproxy' | 'sousaku' | 'other';
+    apiType: 'apimart' | 'openai' | 'nanobanana2' | 'cliproxy' | 'sousaku' | 'other' | string;
     params: GenerateParams;
     createdAt: string;
     originalUrl?: string;
     isFavorite: boolean;
     tags: string[];
+    jobId?: string;
+    resultIndex?: number;
+    providerIndex?: number;
+    inputImages?: ReferenceImageInput[];
+}
+
+export interface ReferenceImageInput {
+    url?: string;
+    ref_id?: string;
+    public_url?: string;
+    name?: string;
 }
 
 // Generation parameters
@@ -43,7 +54,7 @@ export interface GenerateRequest {
     quality?: string;
     moderation?: string;
     n?: number;  // 生成数量 1-10
-    image_urls?: { url: string }[];
+    image_urls?: { url: string; ref_id?: string; public_url?: string }[];
     thinking_level?: string; // Nanobanana2: "High" or "Minimal"
     model?: string;          // APIMart: model name
     mask_data?: string;      // Mask PNG as base64 data URI (transparent = editable)
@@ -111,9 +122,17 @@ export interface FilterState {
 // Upload state
 export interface UploadedImage {
     id: string;
-    file: File;
+    file?: File;
+    name?: string;
     preview: string;
     base64?: string;
+    refId?: string;
+    localUrl?: string;
+    publicUrl?: string;
+    contentType?: string;
+    size?: number;
+    status?: 'uploading' | 'ready' | 'failed';
+    error?: string;
 }
 
 // ============ Mask / Inpainting Support ============

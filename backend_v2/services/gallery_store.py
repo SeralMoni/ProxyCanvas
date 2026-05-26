@@ -46,7 +46,14 @@ def load_gallery(*, limit: int | None = None, offset: int = 0) -> dict[str, Any]
         query = """
             SELECT *
             FROM gallery_images
-            ORDER BY created_at DESC, id ASC
+            ORDER BY
+                created_at DESC,
+                CASE
+                    WHEN json_valid(extra_json)
+                    THEN COALESCE(CAST(json_extract(extra_json, '$.resultIndex') AS INTEGER), 999999)
+                    ELSE 999999
+                END ASC,
+                id ASC
             """
         params: list[Any] = []
         if limit is not None:
@@ -111,7 +118,8 @@ def upsert_image(image: dict[str, Any]) -> bool:
     image_id = str(image["id"])
     with _gallery_lock, _connect() as connection:
         existing = connection.execute("SELECT 1 FROM gallery_images WHERE id = ?", (image_id,)).fetchone()
-        _insert_images(connection, [image])
+        connection.execute("DELETE FROM gallery_deleted_images WHERE id = ?", (image_id,))
+        _insert_images(connection, [image], skip_deleted=False)
         connection.commit()
         return existing is None
 
@@ -120,11 +128,13 @@ def delete_image(image_id: str) -> tuple[bool, str | None]:
     """Delete a gallery record. Returns (deleted, saved_file_path)."""
     _ensure_ready()
     with _gallery_lock, _connect() as connection:
+        _mark_deleted_locked(connection, [image_id])
         row = connection.execute(
             "SELECT relative_path, saved_file_path, local_path FROM gallery_images WHERE id = ?",
             (image_id,),
         ).fetchone()
         if not row:
+            connection.commit()
             return False, None
 
         connection.execute("DELETE FROM gallery_image_tags WHERE image_id = ?", (image_id,))
@@ -175,6 +185,7 @@ def delete_images(image_ids: list[str]) -> list[tuple[str, str | None]]:
     deleted: list[tuple[str, str | None]] = []
     _ensure_ready()
     with _gallery_lock, _connect() as connection:
+        _mark_deleted_locked(connection, ids)
         for image_id in ids:
             row = connection.execute(
                 "SELECT relative_path, saved_file_path, local_path FROM gallery_images WHERE id = ?",
@@ -259,6 +270,73 @@ def add_images(images: list[dict[str, Any]]) -> None:
         connection.commit()
 
 
+def add_job_images(images: list[dict[str, Any]]) -> int:
+    """Add worker-published images without reviving deleted slots.
+
+    Existing user metadata such as favorite state and tags wins over the
+    worker's default values, because a final provider poll can arrive after the
+    user has already organized partial results.
+    """
+    if not images:
+        return 0
+
+    _ensure_ready()
+    with _gallery_lock, _connect() as connection:
+        inserted = _insert_images(
+            connection,
+            [image for image in images if isinstance(image, dict) and image.get("id")],
+            preserve_user_fields=True,
+            skip_deleted=True,
+        )
+        connection.commit()
+        return inserted
+
+
+def is_image_deleted(image_id: str) -> bool:
+    _ensure_ready()
+    with _gallery_lock, _connect() as connection:
+        return _is_deleted_locked(connection, image_id)
+
+
+def gallery_file_records() -> list[dict[str, str | None]]:
+    """Return current gallery file references for storage accounting."""
+    _ensure_ready()
+    with _gallery_lock, _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, relative_path, saved_file_path, local_path
+            FROM gallery_images
+            """
+        ).fetchall()
+
+    return [
+        {
+            "id": row["id"],
+            "path": _row_file_path(row),
+            "relativePath": row["relative_path"],
+        }
+        for row in rows
+    ]
+
+
+def is_file_still_referenced(file_path: str | None) -> bool:
+    """Return True when another gallery row still points at this file."""
+    target = _normal_file_key(file_path)
+    if not target:
+        return False
+
+    _ensure_ready()
+    with _gallery_lock, _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT relative_path, saved_file_path, local_path
+            FROM gallery_images
+            """
+        ).fetchall()
+
+    return any(_normal_file_key(_row_file_path(row)) == target for row in rows)
+
+
 def _ensure_ready() -> None:
     global _initialized
     if _initialized:
@@ -317,6 +395,14 @@ def _init_db(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gallery_deleted_images (
+            id TEXT PRIMARY KEY,
+            deleted_at TEXT NOT NULL
+        )
+        """
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_gallery_images_created ON gallery_images(created_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_gallery_images_api_type ON gallery_images(api_type)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_gallery_images_favorite ON gallery_images(is_favorite)")
@@ -331,6 +417,43 @@ def _ensure_gallery_column(connection: sqlite3.Connection, name: str, definition
     }
     if name not in columns:
         connection.execute(f"ALTER TABLE gallery_images ADD COLUMN {name} {definition}")
+
+
+def _mark_deleted_locked(connection: sqlite3.Connection, image_ids: list[str]) -> None:
+    timestamp = _now_iso()
+    for image_id in _clean_id_list(image_ids):
+        connection.execute(
+            """
+            INSERT INTO gallery_deleted_images (id, deleted_at)
+            VALUES (?, ?)
+            ON CONFLICT(id) DO UPDATE SET deleted_at = excluded.deleted_at
+            """,
+            (image_id, timestamp),
+        )
+
+
+def _is_deleted_locked(connection: sqlite3.Connection, image_id: str) -> bool:
+    if not image_id:
+        return False
+    row = connection.execute("SELECT 1 FROM gallery_deleted_images WHERE id = ?", (str(image_id),)).fetchone()
+    return row is not None
+
+
+def _existing_user_fields_locked(connection: sqlite3.Connection, image_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT is_favorite FROM gallery_images WHERE id = ?",
+        (image_id,),
+    ).fetchone()
+    if not row:
+        return None
+    tag_rows = connection.execute(
+        "SELECT tag FROM gallery_image_tags WHERE image_id = ? ORDER BY tag ASC",
+        (image_id,),
+    ).fetchall()
+    return {
+        "isFavorite": bool(row["is_favorite"]),
+        "tags": [tag_row["tag"] for tag_row in tag_rows],
+    }
 
 
 def _is_gallery_empty(connection: sqlite3.Connection) -> bool:
@@ -358,11 +481,26 @@ def _load_json_gallery() -> dict[str, Any]:
     return data if isinstance(data, dict) else _empty_gallery()
 
 
-def _insert_images(connection: sqlite3.Connection, images: list[dict[str, Any]]) -> None:
+def _insert_images(
+    connection: sqlite3.Connection,
+    images: list[dict[str, Any]],
+    *,
+    preserve_user_fields: bool = False,
+    skip_deleted: bool = True,
+) -> int:
     timestamp = _now_iso()
+    inserted = 0
     for image in images:
         normalized = _normalize_image(image)
         image_id = normalized["id"]
+        if skip_deleted and _is_deleted_locked(connection, image_id):
+            continue
+        if preserve_user_fields:
+            user_fields = _existing_user_fields_locked(connection, image_id)
+            if user_fields:
+                normalized["isFavorite"] = user_fields["isFavorite"]
+                if user_fields["tags"]:
+                    normalized["tags"] = user_fields["tags"]
         connection.execute(
             """
             INSERT INTO gallery_images (
@@ -414,6 +552,8 @@ def _insert_images(connection: sqlite3.Connection, images: list[dict[str, Any]])
                 "INSERT OR IGNORE INTO gallery_image_tags (image_id, tag) VALUES (?, ?)",
                 (image_id, tag),
             )
+        inserted += 1
+    return inserted
 
 
 def _normalize_image(image: dict[str, Any]) -> dict[str, Any]:
@@ -532,6 +672,15 @@ def _row_file_path(row: sqlite3.Row) -> str | None:
         if path:
             return str(path)
     return row["saved_file_path"] or _path_from_serve_url(row["local_path"] or "")
+
+
+def _normal_file_key(file_path: str | None) -> str | None:
+    if not file_path:
+        return None
+    try:
+        return str(Path(file_path).resolve()).casefold()
+    except (OSError, RuntimeError, ValueError):
+        return str(file_path).casefold()
 
 
 def _clean_tag_list(value: Any) -> list[str]:

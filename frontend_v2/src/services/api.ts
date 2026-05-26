@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { BackendCapabilities, GenerateRequest, GenerateResponse, ImageItem, TaskStatusResponse } from '../types';
+import type { BackendCapabilities, GenerateRequest, GenerateResponse, ImageItem, ReferenceImageInput, TaskStatusResponse } from '../types';
 
 const api = axios.create({
     baseURL: '/api',
@@ -96,16 +96,17 @@ export interface GenerationJob {
     status: 'queued' | 'submitting' | 'running' | 'saving' | 'succeeded' | 'failed' | 'cancelled' | 'timeout';
     prompt: string;
     params: Record<string, unknown>;
-    input_images: Array<{ url: string }>;
+    input_images: ReferenceImageInput[];
     external_task_id?: string;
     progress: number;
     result: Array<Record<string, any>>;
     error?: string;
+    attempts?: number;
+    max_attempts?: number;
     created_at: string;
     updated_at: string;
     started_at?: string;
     finished_at?: string;
-    events?: Array<Record<string, unknown>>;
 }
 
 export interface GenerationJobResponse {
@@ -293,18 +294,62 @@ export interface BackendSettings {
         maxWorkers: SettingValue<number>;
         pollIntervalSeconds: SettingValue<number>;
         defaultTimeoutSeconds: SettingValue<number>;
+        sousakuStaleTaskSeconds: SettingValue<number>;
         providerLimits: SettingValue<Record<string, number>>;
     };
     network: {
         httpProxies: SettingValue<Record<string, string> | null>;
+        publicUrlTtlSeconds: SettingValue<number>;
+    };
+    logging: {
+        level: SettingValue<'DEBUG' | 'INFO' | 'OK' | 'WARN' | 'ERROR'>;
+        color: SettingValue<boolean>;
+        sousakuProgressPanel: SettingValue<boolean>;
     };
     configFiles: Record<string, { path: string; exists: boolean }>;
+}
+
+export interface StorageUsage {
+    saveDir: string;
+    gallery: {
+        records: number;
+        files: number;
+        bytes: number;
+        missing: number;
+        imports: {
+            path: string;
+            files: number;
+            bytes: number;
+        };
+    };
+    thumbnailCache: {
+        path: string;
+        files: number;
+        bytes: number;
+        maxBytes: number;
+    };
+    referenceLibrary?: {
+        path: string;
+        files: number;
+        bytes: number;
+        assets: {
+            path: string;
+            files: number;
+            bytes: number;
+        };
+        thumbnails: {
+            path: string;
+            files: number;
+            bytes: number;
+        };
+    };
 }
 
 export interface RuntimeProvider {
     id: string;
     label: string;
     type: string;
+    protocol?: string;
     enabled: boolean;
     source: string;
     baseUrl: string;
@@ -330,6 +375,9 @@ export interface RuntimeProvider {
     capabilities: string[];
     notes?: string;
     configPath?: string;
+    stream?: boolean;
+    timeoutSeconds?: number;
+    badgeColor?: string;
     builtin?: boolean;
 }
 
@@ -377,10 +425,17 @@ export interface AppSettingsPatch {
         maxWorkers?: number;
         pollIntervalSeconds?: number;
         defaultTimeoutSeconds?: number;
+        sousakuStaleTaskSeconds?: number;
         providerLimits?: Record<string, number>;
     };
     network?: {
         httpProxies?: Record<string, string> | null;
+        publicUrlTtlSeconds?: number;
+    };
+    logging?: {
+        level?: 'DEBUG' | 'INFO' | 'OK' | 'WARN' | 'ERROR';
+        color?: boolean;
+        sousakuProgressPanel?: boolean;
     };
 }
 
@@ -404,6 +459,25 @@ export async function resetBackendSettings(): Promise<AppSettingsPatch> {
     return response.data.data;
 }
 
+export async function loadStorageUsage(): Promise<StorageUsage> {
+    const response = await api.get<{ success: boolean; data: StorageUsage; error?: { message?: string } }>('/storage/usage', {
+        timeout: 120000,
+    });
+    if (!response.data.success) {
+        throw new Error(response.data.error?.message || 'Failed to load storage usage');
+    }
+    return response.data.data;
+}
+
+export async function clearStorageCache(cacheName: 'thumbnails'): Promise<void> {
+    const response = await api.post<{ success: boolean; error?: { message?: string } }>(`/storage/cache/${cacheName}/clear`, {}, {
+        timeout: 120000,
+    });
+    if (!response.data.success) {
+        throw new Error(response.data.error?.message || 'Failed to clear cache');
+    }
+}
+
 export async function loadRuntimeProviders(): Promise<RuntimeProvider[]> {
     const response = await api.get<{ success: boolean; data: RuntimeProvider[] }>('/providers', {
         timeout: 30000,
@@ -414,14 +488,42 @@ export async function loadRuntimeProviders(): Promise<RuntimeProvider[]> {
     return response.data.data;
 }
 
+export async function createRuntimeProvider(payload: {
+    id?: string;
+    label: string;
+    type?: string;
+    protocol?: string;
+    baseUrl: string;
+    apiKey?: string;
+    defaultModel?: string;
+    stream?: boolean;
+    badgeColor?: string;
+    models?: RuntimeProvider['models'];
+}): Promise<RuntimeProvider> {
+    const response = await api.post<{ success: boolean; data: RuntimeProvider; error?: { message?: string } }>('/providers', payload, {
+        timeout: 30000,
+    });
+    if (!response.data.success) {
+        throw new Error(response.data.error?.message || 'Failed to create provider');
+    }
+    return response.data.data;
+}
+
 export async function saveRuntimeProvider(providerId: string, patch: {
     label?: string;
+    type?: string;
+    protocol?: string;
     enabled?: boolean;
     baseUrl?: string;
     apiKey?: string;
     defaultModel?: string;
+    models?: RuntimeProvider['models'];
+    capabilities?: string[];
     configPath?: string;
     notes?: string;
+    stream?: boolean;
+    timeoutSeconds?: number;
+    badgeColor?: string;
 }): Promise<RuntimeProvider> {
     const response = await api.patch<{ success: boolean; data: RuntimeProvider }>(`/providers/${providerId}`, patch, {
         timeout: 30000,
@@ -430,6 +532,16 @@ export async function saveRuntimeProvider(providerId: string, patch: {
         throw new Error('Failed to save provider');
     }
     return response.data.data;
+}
+
+export async function deleteRuntimeProvider(providerId: string): Promise<{ success: boolean }> {
+    const response = await api.delete<{ success: boolean }>(`/providers/${providerId}`, {
+        timeout: 30000,
+    });
+    if (!response.data.success) {
+        throw new Error('Failed to delete provider');
+    }
+    return response.data;
 }
 
 // Save a thought/draft image to local storage
@@ -509,6 +621,75 @@ export async function uploadImage(file: File): Promise<{
     });
 
     return response.data;
+}
+
+export interface ReferenceImageAsset {
+    ref_id: string;
+    name: string;
+    local_url: string;
+    preview_url: string;
+    content_type: string;
+    suffix: string;
+    size: number;
+    width?: number;
+    height?: number;
+    public_urls?: Record<string, { url?: string }>;
+    created_at: number;
+    last_used_at: number;
+}
+
+export async function uploadReferenceImage(file: File): Promise<ReferenceImageAsset> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await api.post<{ success: boolean; data: ReferenceImageAsset; error?: { message?: string } }>('/reference-images', formData, {
+        timeout: 120000,
+    });
+    if (!response.data.success) {
+        throw new Error(response.data.error?.message || '参考图上传失败');
+    }
+    return response.data.data;
+}
+
+export async function importReferenceImageUrl(url: string): Promise<ReferenceImageAsset> {
+    const response = await api.post<{ success: boolean; data: ReferenceImageAsset; error?: { message?: string } }>('/reference-images', { url }, {
+        timeout: 120000,
+    });
+    if (!response.data.success) {
+        throw new Error(response.data.error?.message || '参考图导入失败');
+    }
+    return response.data.data;
+}
+
+export async function loadReferenceImages(limit = 120, offset = 0): Promise<{ items: ReferenceImageAsset[]; total: number }> {
+    const response = await api.get<{ success: boolean; data: ReferenceImageAsset[]; total?: number; error?: { message?: string } }>('/reference-images', {
+        params: { limit, offset },
+        timeout: 30000,
+    });
+    if (!response.data.success) {
+        throw new Error(response.data.error?.message || '参考图库加载失败');
+    }
+    return {
+        items: response.data.data,
+        total: response.data.total ?? response.data.data.length,
+    };
+}
+
+export async function deleteReferenceImage(refId: string): Promise<void> {
+    try {
+        const response = await api.delete<{ success: boolean; error?: { message?: string } }>(`/reference-images/${encodeURIComponent(refId)}`, {
+            timeout: 30000,
+        });
+        if (!response.data.success) {
+            throw new Error(response.data.error?.message || '参考图删除失败');
+        }
+    } catch (error) {
+        if (axios.isAxiosError(error)) {
+            if (error.response?.status === 404) return;
+            const data = error.response?.data as { error?: { message?: string }; message?: string } | undefined;
+            throw new Error(data?.error?.message || data?.message || '参考图删除失败');
+        }
+        throw error;
+    }
 }
 
 // Convert file to base64 data URI
@@ -703,23 +884,36 @@ export async function loadGallery(options?: { limit?: number; offset?: number })
     throw new Error('Failed to load gallery');
 }
 
-// Serialized gallery save queue to prevent concurrent writes from racing
-let _gallerySaveQueue: Promise<void> = Promise.resolve();
+// Keep gallery writes ordered so a late save cannot recreate a just-deleted image.
+let _galleryMutationQueue: Promise<unknown> = Promise.resolve();
+const _deletedGalleryImageIds = new Set<string>();
 
-function queuedSaveToGallery(image: ImageItem): void {
-    _gallerySaveQueue = _gallerySaveQueue
-        .then(() => api.post('/gallery', image))
-        .then(() => {})
-        .catch(e => console.error('Failed to save image to gallery:', e));
+function enqueueGalleryMutation<T>(task: () => Promise<T>): Promise<T> {
+    const run = _galleryMutationQueue.then(task, task);
+    _galleryMutationQueue = run.catch(() => {});
+    return run;
 }
 
-export async function saveToGallery(image: ImageItem): Promise<void> {
-    queuedSaveToGallery(image);
+export async function saveToGallery(image: ImageItem, options?: { force?: boolean }): Promise<void> {
+    if (options?.force) {
+        _deletedGalleryImageIds.delete(image.id);
+    }
+    if (_deletedGalleryImageIds.has(image.id)) return;
+    await enqueueGalleryMutation(async () => {
+        if (options?.force) {
+            _deletedGalleryImageIds.delete(image.id);
+        }
+        if (_deletedGalleryImageIds.has(image.id)) return;
+        await api.post('/gallery', image);
+    });
 }
 
 export async function deleteFromGallery(imageId: string, deleteLocal?: boolean): Promise<void> {
+    _deletedGalleryImageIds.add(imageId);
     const params = deleteLocal ? '?delete_local=true' : '';
-    await api.delete(`/gallery/${imageId}${params}`);
+    await enqueueGalleryMutation(async () => {
+        await api.delete(`/gallery/${imageId}${params}`);
+    });
 }
 
 export async function updateGalleryTags(tags: string[]): Promise<void> {
@@ -731,11 +925,12 @@ export async function batchDeleteGalleryImages(ids: string[], deleteLocal: boole
     localDeleted: number;
     localSkipped: number;
 }> {
-    const response = await api.post<{ success: boolean; data?: { deleted: number; localDeleted: number; localSkipped: number }; message?: string }>(
+    ids.forEach((id) => _deletedGalleryImageIds.add(id));
+    const response = await enqueueGalleryMutation(() => api.post<{ success: boolean; data?: { deleted: number; localDeleted: number; localSkipped: number }; message?: string }>(
         '/gallery/batch/delete',
         { ids, deleteLocal },
         { timeout: 120000 },
-    );
+    ));
     if (!response.data.success || !response.data.data) {
         throw new Error(response.data.message || '批量删除失败');
     }

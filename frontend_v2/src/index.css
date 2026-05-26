@@ -82,6 +82,18 @@ body {
   background: var(--text-secondary);
 }
 
+input[type='number'] {
+  color-scheme: dark;
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
 /* Selection */
 ::selection {
   background-color: var(--accent-primary);

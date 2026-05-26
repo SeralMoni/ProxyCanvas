@@ -255,6 +255,7 @@ class SousakuClient:
             "accept": "*/*",
             "accept-language": "zh-CN,zh;q=0.9",
             "authorization": self.token,
+            "cookie": f"pp_user_token={self.token}",
             "origin": "https://sousaku.ai",
             "referer": "https://sousaku.ai/",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",

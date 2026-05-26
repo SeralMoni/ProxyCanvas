@@ -92,3 +92,5 @@ data/*.sqlite-*
 gallery/
 config/sousaku_accounts.json
 config/lumalabs_config.json
+experiments/
+

@@ -2,17 +2,13 @@ import { useState, useRef, useMemo, useEffect } from 'react';
 import { Send, Image as ImageIcon, Settings, Loader2, X, Plus, Check, Paintbrush } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useStore, useGenerateParams } from '../../store';
-import {
-    fileToBase64,
-    uploadImage,
-} from '../../services/api';
 import type { RuntimeProvider } from '../../services/api';
 import { startGeneration } from '../../services/generationService';
-import type { GenerateParams, ImageItem, UploadedImage } from '../../types';
+import type { GenerateParams, ImageItem, ReferenceImageInput, UploadedImage } from '../../types';
 import { isMaskSupported } from '../../types';
 import { MaskEditor } from './MaskEditor';
 import { useProviders } from '../../hooks/useProviders';
-import { generationProviderOptions, isBuiltinApi } from '../../utils/providers';
+import { generationProviderOptions } from '../../utils/providers';
 
 type ModelOption = {
     value: string;
@@ -38,6 +34,8 @@ type ModelConstraints = {
     fixedImageCount?: number;
     resolutionByRatio?: Record<string, string[]>;
 };
+
+const HIDDEN_MODEL_CONTROL_KEYS = new Set(['referenceImage', 'mask']);
 
 const FALLBACK_CLIPROXY_MODELS: ModelOption[] = [
     { value: 'gpt-image-2', label: 'GPT-Image-2' },
@@ -109,6 +107,30 @@ function pixelSizeFor(model: ModelOption | undefined, ratio: string, resolution:
     return byRatio?.[resolution] || undefined;
 }
 
+function compactReferenceInput(img: UploadedImage): ReferenceImageInput | null {
+    const refId = img.refId;
+    const localUrl = img.localUrl || (refId ? `/api/reference-images/${refId}` : undefined);
+    const fallbackUrl = img.base64 && !img.base64.startsWith('data:')
+        ? img.base64
+        : undefined;
+    const publicUrl = img.publicUrl && !img.publicUrl.startsWith('data:')
+        ? img.publicUrl
+        : undefined;
+    const url = localUrl || fallbackUrl;
+    const item: ReferenceImageInput = {};
+
+    if (url) item.url = url;
+    if (refId) item.ref_id = refId;
+    if (publicUrl) item.public_url = publicUrl;
+    if (img.name) item.name = img.name;
+
+    return item.ref_id || item.url || item.public_url ? item : null;
+}
+
+function isReferenceReady(img: UploadedImage) {
+    return Boolean(img.refId || img.localUrl || img.publicUrl || img.base64) && (img.status || 'ready') === 'ready';
+}
+
 export function BottomPanel() {
     const selectedApi = useStore((s) => s.selectedApi);
     const setSelectedApi = useStore((s) => s.setSelectedApi);
@@ -117,14 +139,19 @@ export function BottomPanel() {
     const generateParams = useGenerateParams();
     const setGenerateParams = useStore((s) => s.setGenerateParams);
     const uploadedImages = useStore((s) => s.uploadedImages);
-    const addUploadedImage = useStore((s) => s.addUploadedImage);
+    const selectedRefs = useStore((s) => s.selectedReferenceIds);
+    const loadReferenceImagesFromServer = useStore((s) => s.loadReferenceImagesFromServer);
+    const uploadReferenceImages = useStore((s) => s.uploadReferenceImages);
+    const addReferenceUrl = useStore((s) => s.addReferenceUrl);
     const removeUploadedImage = useStore((s) => s.removeUploadedImage);
+    const clearSelectedReferenceIds = useStore((s) => s.clearSelectedReferenceIds);
+    const toggleSelectedReferenceId = useStore((s) => s.toggleSelectedReferenceId);
     const currentPrompt = useStore((s) => s.currentPrompt);
     const setCurrentPrompt = useStore((s) => s.setCurrentPrompt);
     const autoClearPrompt = useStore((s) => s.autoClearPrompt);
     const addImagesLocal = useStore((s) => s.addImagesLocal);
     const updateImage = useStore((s) => s.updateImage);
-    const removeImage = useStore((s) => s.removeImage);
+    const removeImageLocalOnly = useStore((s) => s.removeImageLocalOnly);
     const addThoughtImages = useStore((s) => s.addThoughtImages);
     const maskData = useStore((s) => s.maskData);
     const maskFeather = useStore((s) => s.maskFeather);
@@ -134,13 +161,15 @@ export function BottomPanel() {
     const [showSettings, setShowSettings] = useState(false);
     const [maskEditingImageId, setMaskEditingImageId] = useState<string | null>(null);
     const [showImagePicker, setShowImagePicker] = useState(false);
-    const [selectedRefs, setSelectedRefs] = useState<string[]>([]);
     const [error, setError] = useState<string | null>(null);
-    const [uploadingCount, setUploadingCount] = useState(0);
     const [isPromptFocused, setIsPromptFocused] = useState(false);
     const [isDragging, setIsDragging] = useState(false);
+    const [referenceTotal, setReferenceTotal] = useState(0);
+    const [referenceLoadingMore, setReferenceLoadingMore] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const referenceLibraryLoadedRef = useRef(false);
+    const referenceRecoveryAttemptedRef = useRef(false);
     const { providers } = useProviders();
 
     const apiOptions = useMemo(() => {
@@ -158,12 +187,66 @@ export function BottomPanel() {
         () => providerModelOptions(providers, 'apimart', FALLBACK_APIMART_MODELS),
         [providers],
     );
+    const selectedProvider = useMemo(
+        () => providers.find((provider) => provider.id === selectedApi),
+        [providers, selectedApi],
+    );
 
     useEffect(() => {
         if (!apiOptions.some((option) => option.value === selectedApi)) {
             setSelectedApi(apiOptions[0].value);
         }
     }, [apiOptions, selectedApi, setSelectedApi]);
+
+    useEffect(() => {
+        if (!showImagePicker) {
+            referenceRecoveryAttemptedRef.current = false;
+            return;
+        }
+        const missingSelected = selectedRefs.some((id) => !uploadedImages.some((img) => img.id === id));
+        const shouldRecoverSelection = missingSelected && !referenceRecoveryAttemptedRef.current;
+        if (referenceLibraryLoadedRef.current && !shouldRecoverSelection) return;
+        if (shouldRecoverSelection) {
+            referenceRecoveryAttemptedRef.current = true;
+        }
+        referenceLibraryLoadedRef.current = true;
+        loadReferenceImagesFromServer({ reset: true }).then((result) => {
+            setReferenceTotal(result.total);
+        }).catch(() => {
+            referenceLibraryLoadedRef.current = false;
+        });
+    }, [loadReferenceImagesFromServer, selectedRefs, showImagePicker, uploadedImages]);
+
+    useEffect(() => {
+        if (!showImagePicker) return;
+        const validIds = new Set(uploadedImages.filter(isReferenceReady).map((img) => img.id));
+        const validSelectedRefs = selectedRefs.filter((id) => validIds.has(id));
+        if (validSelectedRefs.length !== selectedRefs.length) {
+            useStore.getState().setSelectedReferenceIds(validSelectedRefs);
+        }
+    }, [selectedRefs, showImagePicker, uploadedImages]);
+
+    const handleLoadMoreReferences = async () => {
+        if (referenceLoadingMore) return;
+        setReferenceLoadingMore(true);
+        try {
+            const result = await loadReferenceImagesFromServer();
+            setReferenceTotal(result.total);
+        } finally {
+            setReferenceLoadingMore(false);
+        }
+    };
+
+    const handleRemoveReferenceImage = async (img: UploadedImage) => {
+        try {
+            await removeUploadedImage(img.id);
+            if (img.refId) {
+                setReferenceTotal((total) => Math.max(0, total - 1));
+            }
+        } catch (removeError) {
+            setError(removeError instanceof Error ? removeError.message : '参考图删除失败');
+        }
+    };
 
     // Upload file to image hosting and get URL
     const handleFileUpload = async (files: FileList | null) => {
@@ -172,93 +255,15 @@ export function BottomPanel() {
         const fileArray = Array.from(files).filter(f => f.type.startsWith('image/'));
         if (fileArray.length === 0) return;
 
-        setUploadingCount(fileArray.length);
-
-        for (const file of fileArray) {
-            const id = crypto.randomUUID();
-            const preview = URL.createObjectURL(file);
-
-            // Add placeholder immediately for UI feedback
-            addUploadedImage({
-                id,
-                file,
-                preview,
-                base64: undefined, // Will be replaced with URL
-            });
-
-            try {
-                // Upload to image hosting (auto-compresses if >10MB)
-                const result = await uploadImage(file);
-
-                if (result.success && result.url) {
-                    // Update with actual URL (store URL in base64 field for simplicity)
-                    // The image is now on the server with a URL
-                    const updatedImage: UploadedImage = {
-                        id,
-                        file,
-                        preview,
-                        base64: result.url, // Store URL here
-                    };
-
-                    // Remove old and add updated
-                    removeUploadedImage(id);
-                    addUploadedImage(updatedImage);
-                    setSelectedRefs(prev => [...prev, id]);
-                } else {
-                    throw new Error(result.message || '上传失败');
-                }
-            } catch (err) {
-                console.error('Upload to hosting failed, falling back to base64:', err);
-
-                // Fallback: use base64 directly
-                try {
-                    const base64 = await fileToBase64(file);
-                    const updatedImage: UploadedImage = {
-                        id,
-                        file,
-                        preview,
-                        base64,
-                    };
-
-                    removeUploadedImage(id);
-                    addUploadedImage(updatedImage);
-                    setSelectedRefs(prev => [...prev, id]);
-
-                    // Warn user about fallback
-                    if (file.size > 10 * 1024 * 1024) {
-                        setError(`⚠️ 图床不可用，使用本地模式。大图(${(file.size / 1024 / 1024).toFixed(1)}MB)可能影响生成。`);
-                    }
-                } catch (base64Err) {
-                    removeUploadedImage(id);
-                    setError(`图片处理失败`);
-                }
-            }
-        }
-
-        setUploadingCount(0);
+        uploadReferenceImages(fileArray);
     };
 
     // Handle URL drop - directly use URL without downloading (avoids CORS issues)
     const handleUrlUpload = async (url: string) => {
         try {
-            setUploadingCount(1);
-            const id = crypto.randomUUID();
-
-            // Directly add the URL image without uploading
-            addUploadedImage({
-                id,
-                file: new File([], 'remote-image', { type: 'image/png' }), // Dummy file
-                preview: url, // Use URL as preview
-                base64: url,  // Store URL directly as the source (treat as base64/url field)
-            });
-
-            // Auto-select it
-            setSelectedRefs(prev => [...prev, id]);
-
-            setUploadingCount(0);
+            addReferenceUrl(url);
         } catch (err) {
             setError(`URL 处理失败: ${err instanceof Error ? err.message : '未知错误'}`);
-            setUploadingCount(0);
         }
     };
 
@@ -302,11 +307,7 @@ export function BottomPanel() {
     };
 
     const toggleRefSelection = (id: string) => {
-        setSelectedRefs(prev =>
-            prev.includes(id)
-                ? prev.filter(i => i !== id)
-                : [...prev, id]
-        );
+        toggleSelectedReferenceId(id);
     };
 
     const handleGenerate = async () => {
@@ -317,10 +318,14 @@ export function BottomPanel() {
         // Get selected reference images - use their URLs, preserving SELECTION order
         const selectedImages = selectedRefs
             .map(id => uploadedImages.find(img => img.id === id))
-            .filter((img): img is UploadedImage => !!img && !!img.base64);
-        const imageUrls = selectedImages.map((img) => ({
-            url: img.base64!,
-        }));
+            .filter((img): img is UploadedImage => !!img && isReferenceReady(img));
+        if (selectedRefs.length > selectedImages.length) {
+            setError('有参考图尚未就绪，请重新确认选择。');
+            return;
+        }
+        const imageUrls = selectedImages
+            .map(compactReferenceInput)
+            .filter((item): item is ReferenceImageInput => Boolean(item));
 
         const prompt = currentPrompt;
         const params = { ...generateParams };
@@ -339,6 +344,7 @@ export function BottomPanel() {
         // 1. Create placeholder images immediately
         const placeholderIds: string[] = [];
         const placeholders: ImageItem[] = [];
+        const batchCreatedAtMs = Date.now();
         for (let i = 0; i < imageCount; i++) {
             const placeholderId = crypto.randomUUID();
             placeholderIds.push(placeholderId);
@@ -351,9 +357,11 @@ export function BottomPanel() {
                 prompt,
                 apiType,
                 params,
-                createdAt: new Date().toISOString(),
+                createdAt: new Date(batchCreatedAtMs - i).toISOString(),
                 isFavorite: false,
                 tags: [],
+                inputImages: imageUrls,
+                resultIndex: i + 1,
             });
         }
         addImagesLocal(placeholders);
@@ -378,12 +386,22 @@ export function BottomPanel() {
             {
                 onSuccess: (placeholderId, result) => {
                     console.log(`✅ Image ${placeholderId} completed`);
-                    updateImage(placeholderId, result);
+                    return updateImage(placeholderId, result);
                 },
                 onError: (placeholderId, error) => {
                     console.error(`❌ Image ${placeholderId} failed:`, error);
                     setError(error);
-                    removeImage(placeholderId);
+                    removeImageLocalOnly(placeholderId);
+                },
+                onReset: (placeholderId) => {
+                    updateImage(placeholderId, {
+                        status: 'loading',
+                        localPath: '',
+                        thumbnail: '',
+                        savedFilePath: undefined,
+                        originalUrl: undefined,
+                        tags: [],
+                    });
                 },
                 onThoughtImages: (images) => {
                     console.log(`🎨 Received ${images.length} thought images`);
@@ -435,8 +453,19 @@ export function BottomPanel() {
         if (selectedApi === 'cliproxy') return cliproxyModelOptions;
         if (selectedApi === 'sousaku') return sousakuModelOptions;
         if (selectedApi === 'nanobanana2') return nanobanana2ModelOptions;
-        return apimartModelOptions;
-    }, [apimartModelOptions, cliproxyModelOptions, nanobanana2ModelOptions, openaiModelOptions, selectedApi, sousakuModelOptions]);
+        if (selectedApi === 'apimart') return apimartModelOptions;
+        return providerModelOptions(providers, selectedApi, [{
+            value: selectedProvider?.defaultModel || 'gpt-image-2',
+            label: selectedProvider?.defaultModel || 'gpt-image-2',
+            defaults: { ratio: '16:9', quality: 'high', imageCount: 1 },
+            controls: [
+                { key: 'ratio', label: '比例', type: 'select', options: ['1:1', '4:3', '3:4', '16:9', '9:16'] },
+                { key: 'quality', label: '质量', type: 'select', options: ['low', 'medium', 'high'] },
+                { key: 'imageCount', label: '数量', type: 'select', options: [1, 2, 3, 4] },
+            ],
+            features: { referenceImage: true, mask: true },
+        }]);
+    }, [apimartModelOptions, cliproxyModelOptions, nanobanana2ModelOptions, openaiModelOptions, providers, selectedApi, selectedProvider, sousakuModelOptions]);
     const selectedModelKey = modelParamKey(selectedApi);
     const selectedModelValue = String(
         selectedModelByApi[selectedApi] ||
@@ -446,7 +475,9 @@ export function BottomPanel() {
         '',
     );
     const selectedModelConfig = modelOptionsForSelectedApi.find((model) => model.value === selectedModelValue) || modelOptionsForSelectedApi[0];
-    const selectedModelControls = selectedModelConfig?.controls || [];
+    const selectedModelControls = (selectedModelConfig?.controls || []).filter(
+        (control) => !HIDDEN_MODEL_CONTROL_KEYS.has(String(control.key)),
+    );
 
     const handleModelChange = (nextModelValue: string) => {
         setSelectedModel(nextModelValue);
@@ -568,6 +599,7 @@ export function BottomPanel() {
         </>
     );
 
+    const uploadingCount = uploadedImages.filter((img) => img.status === 'uploading').length;
     const selectedCount = selectedRefs.length;
 
     // Check if current API+model supports mask editing
@@ -616,8 +648,7 @@ export function BottomPanel() {
                                     <select
                                         value={selectedApi}
                                         onChange={(e) => {
-                                            const api = e.target.value;
-                                            if (isBuiltinApi(api)) setSelectedApi(api);
+                                            setSelectedApi(e.target.value);
                                         }}
                                         className="px-2 py-1 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border-subtle)] text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)]"
                                     >
@@ -772,69 +803,95 @@ export function BottomPanel() {
 
                             {/* Uploaded images grid */}
                             {uploadedImages.length > 0 ? (
-                                <div className="grid grid-cols-4 gap-2 max-h-64 overflow-y-auto">
-                                    {uploadedImages.map((img) => (
-                                        <div
-                                            key={img.id}
-                                            onClick={() => img.base64 && toggleRefSelection(img.id)}
-                                            className={`relative aspect-square rounded-lg overflow-hidden cursor-pointer border-2 transition-all ${!img.base64
-                                                ? 'border-yellow-500/50 opacity-50'
-                                                : selectedRefs.includes(img.id)
-                                                    ? 'border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/50'
-                                                    : 'border-transparent hover:border-[var(--text-muted)]'
-                                                }`}
-                                        >
-                                            <img
-                                                src={img.preview}
-                                                alt="Uploaded"
-                                                className="w-full h-full object-cover"
-                                            />
-                                            {!img.base64 && (
-                                                <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-                                                    <Loader2 className="w-4 h-4 animate-spin text-white" />
-                                                </div>
-                                            )}
-                                            {img.base64 && selectedRefs.includes(img.id) && (
-                                                <div className="absolute top-1 right-1 p-0.5 rounded-full bg-[var(--accent-primary)]">
-                                                    <Check className="w-3 h-3 text-white" />
-                                                </div>
-                                            )}
-                                            {/* Mask edit button — only when mask is supported */}
-                                            {maskSupported && img.base64 && (
+                                <div className="max-h-64 overflow-y-auto pr-1">
+                                    <div className="grid grid-cols-4 gap-2">
+                                        {uploadedImages.map((img) => {
+                                            const isReady = isReferenceReady(img);
+                                            const isUploading = img.status === 'uploading';
+                                            return (
+                                            <div
+                                                key={img.id}
+                                                onClick={() => isReady && toggleRefSelection(img.id)}
+                                                className={`relative aspect-square rounded-lg overflow-hidden border-2 transition-all ${!isReady
+                                                    ? 'border-yellow-500/50 opacity-50'
+                                                    : selectedRefs.includes(img.id)
+                                                        ? 'border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/50'
+                                                        : 'border-transparent hover:border-[var(--text-muted)]'
+                                                    } ${isReady ? 'cursor-pointer' : 'cursor-not-allowed'}`}
+                                            >
+                                                <img
+                                                    src={img.preview}
+                                                    alt="Uploaded"
+                                                    className="w-full h-full object-cover"
+                                                />
+                                                {!isReady && (
+                                                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/55 px-1 text-center">
+                                                        {isUploading ? (
+                                                            <>
+                                                                <Loader2 className="w-4 h-4 animate-spin text-white" />
+                                                                <span className="text-[10px] text-white/85">上传中</span>
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                <X className="w-4 h-4 text-red-300" />
+                                                                <span className="text-[10px] text-red-100">失败</span>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                {isReady && selectedRefs.includes(img.id) && (
+                                                    <div className="absolute top-1 right-1 p-0.5 rounded-full bg-[var(--accent-primary)]">
+                                                        <Check className="w-3 h-3 text-white" />
+                                                    </div>
+                                                )}
+                                                {/* Mask edit button — only when mask is supported */}
+                                                {maskSupported && isReady && (
+                                                    <button
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            if (maskData[img.id]) {
+                                                                // Already has mask → remove it
+                                                                removeMaskData(img.id);
+                                                            } else {
+                                                                // Open mask editor
+                                                                setMaskEditingImageId(img.id);
+                                                            }
+                                                        }}
+                                                        className={`absolute bottom-1 left-1 p-1 rounded-full transition-all ${
+                                                            maskData[img.id]
+                                                                ? 'bg-blue-500 text-white opacity-100 ring-1 ring-blue-400/50'
+                                                                : 'bg-black/60 text-white/70 opacity-70 hover:opacity-100'
+                                                        }`}
+                                                        title={maskData[img.id] ? '已有遮罩 (点击移除)' : '编辑遮罩'}
+                                                    >
+                                                        <Paintbrush className="w-3 h-3" />
+                                                    </button>
+                                                )}
+                                                {/* Delete button */}
                                                 <button
                                                     onClick={(e) => {
                                                         e.stopPropagation();
-                                                        if (maskData[img.id]) {
-                                                            // Already has mask → remove it
-                                                            removeMaskData(img.id);
-                                                        } else {
-                                                            // Open mask editor
-                                                            setMaskEditingImageId(img.id);
-                                                        }
+                                                        void handleRemoveReferenceImage(img);
                                                     }}
-                                                    className={`absolute bottom-1 left-1 p-1 rounded-full transition-all ${
-                                                        maskData[img.id]
-                                                            ? 'bg-blue-500 text-white opacity-100 ring-1 ring-blue-400/50'
-                                                            : 'bg-black/60 text-white/70 opacity-70 hover:opacity-100'
-                                                    }`}
-                                                    title={maskData[img.id] ? '已有遮罩 (点击移除)' : '编辑遮罩'}
+                                                    className="absolute bottom-1 right-1 p-1 rounded-full bg-red-500/80 text-white opacity-0 hover:opacity-100 transition-opacity"
+                                                    title={img.refId ? '从参考图库删除' : '移除参考图'}
                                                 >
-                                                    <Paintbrush className="w-3 h-3" />
+                                                    <X className="w-3 h-3" />
                                                 </button>
-                                            )}
-                                            {/* Delete button */}
-                                            <button
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    removeUploadedImage(img.id);
-                                                    setSelectedRefs(prev => prev.filter(i => i !== img.id));
-                                                }}
-                                                className="absolute bottom-1 right-1 p-1 rounded-full bg-red-500/80 text-white opacity-0 hover:opacity-100 transition-opacity"
-                                            >
-                                                <X className="w-3 h-3" />
-                                            </button>
-                                        </div>
-                                    ))}
+                                            </div>
+                                        );})}
+                                    </div>
+                                    {uploadedImages.filter((img) => img.refId).length < referenceTotal && (
+                                        <button
+                                            type="button"
+                                            onClick={handleLoadMoreReferences}
+                                            disabled={referenceLoadingMore}
+                                            className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--text-secondary)] transition-colors hover:border-[var(--accent-primary)] hover:text-[var(--accent-primary)] disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            {referenceLoadingMore && <Loader2 className="h-4 w-4 animate-spin" />}
+                                            加载更多参考图（{uploadedImages.filter((img) => img.refId).length}/{referenceTotal}）
+                                        </button>
+                                    )}
                                 </div>
                             ) : (
                                 <p className="text-center text-[var(--text-muted)] text-sm py-4">
@@ -849,7 +906,7 @@ export function BottomPanel() {
                                 </span>
                                 <div className="flex gap-2">
                                     <button
-                                        onClick={() => setSelectedRefs([])}
+                                        onClick={clearSelectedReferenceIds}
                                         className="px-3 py-1.5 rounded-lg text-sm bg-[var(--bg-secondary)] text-[var(--text-secondary)] hover:bg-[var(--bg-card-hover)]"
                                     >
                                         清除选择

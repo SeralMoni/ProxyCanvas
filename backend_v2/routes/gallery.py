@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from flask import Blueprint, jsonify, request
+import requests
 
 from routes.files import delete_thumbnail_cache_for_source
 from services import gallery_store
@@ -52,7 +54,7 @@ def delete_from_gallery(image_id: str):
 
         if local_path:
             delete_thumbnail_cache_for_source(local_path)
-            if delete_local and os.path.exists(local_path):
+            if delete_local and os.path.exists(local_path) and not gallery_store.is_file_still_referenced(local_path):
                 os.remove(local_path)
 
         if deleted:
@@ -84,6 +86,7 @@ def batch_delete_gallery():
         local_deleted = 0
         local_skipped = 0
         thumbnails_deleted = 0
+        handled_paths: set[str] = set()
         for _, local_path in deleted:
             if not local_path:
                 if delete_local:
@@ -92,7 +95,11 @@ def batch_delete_gallery():
             thumbnails_deleted += delete_thumbnail_cache_for_source(local_path)
             if delete_local:
                 try:
-                    if os.path.exists(local_path):
+                    path_key = str(Path(local_path).resolve()).casefold()
+                    if path_key in handled_paths:
+                        continue
+                    handled_paths.add(path_key)
+                    if os.path.exists(local_path) and not gallery_store.is_file_still_referenced(local_path):
                         os.remove(local_path)
                         local_deleted += 1
                     else:
@@ -163,14 +170,22 @@ def batch_export_gallery():
         skipped = 0
         for image in images:
             source = image.get("savedFilePath") or _path_from_serve_url(str(image.get("localPath") or ""))
-            if not source or not os.path.isfile(source):
-                skipped += 1
-                continue
             try:
-                destination = _unique_destination(target_dir, Path(source).name)
-                shutil.copy2(source, destination)
+                if source and os.path.isfile(source):
+                    destination = _unique_destination(target_dir, Path(source).name)
+                    shutil.copy2(source, destination)
+                    exported += 1
+                    continue
+
+                remote_url = _remote_url_from_image(image)
+                if not remote_url:
+                    skipped += 1
+                    continue
+
+                destination = _unique_destination(target_dir, _filename_from_remote_url(remote_url, image))
+                _download_remote_image(remote_url, destination)
                 exported += 1
-            except OSError:
+            except (OSError, requests.RequestException):
                 skipped += 1
 
         return jsonify({
@@ -230,6 +245,58 @@ def _path_from_serve_url(value: str) -> str | None:
         return None
     path = resolve_allowed_path(raw_path)
     return str(path) if path else unquote(raw_path)
+
+
+def _remote_url_from_image(image: dict) -> str | None:
+    return _find_http_url(image.get("originalUrl")) or _find_http_url(image.get("localPath"))
+
+
+def _find_http_url(value) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text.startswith(("http://", "https://")) else None
+    if isinstance(value, dict):
+        for key in ("url", "originalUrl", "original_url", "src", "image", "data"):
+            url = _find_http_url(value.get(key))
+            if url:
+                return url
+        for item in value.values():
+            url = _find_http_url(item)
+            if url:
+                return url
+    if isinstance(value, list):
+        for item in value:
+            url = _find_http_url(item)
+            if url:
+                return url
+    return None
+
+
+def _filename_from_remote_url(url: str, image: dict) -> str:
+    parsed = urlparse(url)
+    filename = Path(unquote(parsed.path)).name
+    if filename and Path(filename).suffix:
+        return filename
+    image_id = str(image.get("id") or "remote_image")
+    return f"{image_id}.png"
+
+
+def _download_remote_image(url: str, destination: Path) -> None:
+    tmp_path = destination.with_name(f"{destination.name}.tmp")
+    try:
+        with requests.get(url, stream=True, timeout=120) as response:
+            response.raise_for_status()
+            with tmp_path.open("wb") as file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        file.write(chunk)
+        tmp_path.replace(destination)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def current_app_log(message: str, image_id: str) -> None:

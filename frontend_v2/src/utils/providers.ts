@@ -4,7 +4,7 @@ import type { ApiType } from '../store';
 
 export type ProviderId = ImageItem['apiType'] | ApiType | string;
 
-export const BUILTIN_API_ORDER: ApiType[] = ['openai', 'cliproxy', 'sousaku', 'nanobanana2', 'apimart'];
+export const BUILTIN_API_ORDER = ['openai', 'cliproxy', 'sousaku', 'nanobanana2', 'apimart'];
 
 export const FALLBACK_PROVIDER_LABELS: Record<string, string> = {
     openai: 'ChatGPT2API',
@@ -25,7 +25,7 @@ const FALLBACK_BADGE_CLASS: Record<string, string> = {
 };
 
 export function isBuiltinApi(value: string): value is ApiType {
-    return BUILTIN_API_ORDER.includes(value as ApiType);
+    return BUILTIN_API_ORDER.includes(value);
 }
 
 export function providerById(providers: RuntimeProvider[], providerId: ProviderId) {
@@ -43,9 +43,21 @@ export function providerBadgeClass(providerId: ProviderId) {
     return FALLBACK_BADGE_CLASS[id] || 'bg-zinc-500/20 text-zinc-300';
 }
 
+export function providerBadgeStyle(providerId: ProviderId, providers: RuntimeProvider[] = []) {
+    const id = String(providerId || '').toLowerCase();
+    if (isBuiltinApi(id)) return undefined;
+    const provider = providerById(providers, providerId);
+    const color = provider?.badgeColor;
+    if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) return undefined;
+    return {
+        color,
+        backgroundColor: `${color}26`,
+    };
+}
+
 export function generationProviderOptions(providers: RuntimeProvider[]) {
     const byId = new Map(providers.map((provider) => [provider.id, provider]));
-    const options = BUILTIN_API_ORDER
+    const builtinOptions = BUILTIN_API_ORDER
         .map((id) => {
             const provider = byId.get(id);
             if (provider && provider.enabled === false) return null;
@@ -55,6 +67,10 @@ export function generationProviderOptions(providers: RuntimeProvider[]) {
             };
         })
         .filter((item): item is { value: ApiType; label: string } => Boolean(item));
+    const customOptions = providers
+        .filter((provider) => provider.enabled !== false && !BUILTIN_API_ORDER.includes(provider.id))
+        .map((provider) => ({ value: provider.id, label: provider.label || provider.id }));
+    const options = [...builtinOptions, ...customOptions];
     return options.length > 0
         ? options
         : BUILTIN_API_ORDER.map((id) => ({ value: id, label: FALLBACK_PROVIDER_LABELS[id] }));

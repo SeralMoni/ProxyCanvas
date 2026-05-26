@@ -18,47 +18,87 @@ from PIL import Image, ImageFilter
 import config
 from config import TELEGRAPH_URL
 from config import JOBS_DB_PATH, JOB_WORKER_ENABLED, JOB_WORKER_MAX_WORKERS, JOB_PROVIDER_LIMITS
-from services.reference_cache import load_reference_image
+from services.reference_inputs import load_reference_image
+from services.public_uploader import upload_public_image
+from services.reference_library import ensure_public_url
+from services.reference_inputs import normalize_reference_inputs
 from services.jobs import JobStore, JobWorker
 from services import provider_registry
 import concurrent.futures
 import openai
 
 import logging
+from urllib.parse import urlsplit
+from werkzeug.serving import WSGIRequestHandler
 
-# 过滤掉高频轮询/图片读取日志刷屏，但不影响其他任何接口的正常日志
-class NoServeImageLogs(logging.Filter):
+# 过滤掉高频成功访问日志刷屏；错误状态仍然保留，方便排查。
+QUIET_ACCESS_PATHS = (
+    "/api/providers",
+    "/api/settings",
+    "/api/capabilities",
+    "/api/jobs",
+    "/api/openai-tasks",
+    "/api/provider-accounts",
+    "/api/serve-image",
+    "/api/thumbnail",
+    "/api/gallery",
+    "/api/storage/usage",
+    "/api/sousaku-task/",
+)
+QUIET_ACCESS_METHODS = {"GET", "OPTIONS"}
+QUIET_ACCESS_STATUS = {200, 204, 304}
+
+
+def _is_quiet_access_path(path: str) -> bool:
+    return any(path == quiet or path.startswith(f"{quiet}/") for quiet in QUIET_ACCESS_PATHS)
+
+
+class QuietAccessLogs(logging.Filter):
     def filter(self, record):
         message = record.getMessage()
-        if " 200 " in message:
-            quiet_get_paths = (
-                'GET /api/jobs ',
-                'GET /api/jobs?',
-                'GET /api/jobs/',
-            )
-            if any(path in message for path in quiet_get_paths):
-                return False
-        noisy_paths = (
-            '/api/serve-image',
-            '/api/thumbnail',
-            '/api/openai-tasks',
-            '/api/sousaku-task/',
-            '/api/gallery',
-        )
-        return not any(path in message for path in noisy_paths)
+        if not any(status in message for status in (" 200 ", " 204 ", " 304 ")):
+            return True
+        if not any(method in message for method in ('"GET ', '"OPTIONS ')):
+            return True
+        match = re.search(r'"(?:GET|OPTIONS)\s+([^"]+?)\s+HTTP/', message)
+        if not match:
+            return True
+        path = urlsplit(match.group(1)).path
+        return not _is_quiet_access_path(path)
 
-logging.getLogger("werkzeug").addFilter(NoServeImageLogs())
+
+_original_log_request = WSGIRequestHandler.log_request
+
+
+def _quiet_log_request(self, code="-", size="-"):
+    try:
+        method, target, *_ = self.requestline.split()
+        status = int(code)
+        path = urlsplit(target).path
+        if method in QUIET_ACCESS_METHODS and status in QUIET_ACCESS_STATUS and _is_quiet_access_path(path):
+            return
+    except Exception:
+        pass
+    return _original_log_request(self, code, size)
+
+
+WSGIRequestHandler.log_request = _quiet_log_request
+
+logging.getLogger("werkzeug").addFilter(QuietAccessLogs())
 
 LOG_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "OK": 25, "WARN": 30, "ERROR": 40}
-LOG_LEVEL = os.getenv("APIMART_LOG_LEVEL", "INFO").upper()
-LOG_COLOR = os.getenv("APIMART_LOG_COLOR", "1") != "0" and sys.stdout.isatty()
-SOUSAKU_STALE_TASK_SECONDS = int(os.getenv("APIMART_SOUSAKU_STALE_SECONDS", "1800"))
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-if LOG_COLOR and os.name == "nt":
+
+
+def _log_color_enabled():
+    return bool(config.LOG_COLOR and sys.stdout.isatty())
+
+
+if _log_color_enabled() and os.name == "nt":
     os.system("")
 
 LOG_COLORS = {
@@ -160,10 +200,6 @@ def _short(value, limit=140):
 
 class SousakuProgressPanel:
     def __init__(self):
-        self.enabled = (
-            os.getenv("APIMART_SOUSAKU_PROGRESS_PANEL", "1") != "0"
-            and sys.stdout.isatty()
-        )
         self.rows = {}
         self.lines_rendered = 0
         self.lock = None
@@ -172,10 +208,13 @@ class SousakuProgressPanel:
 
             self.lock = threading.RLock()
         except Exception:
-            self.enabled = False
+            self.lock = None
+
+    def is_enabled(self):
+        return bool(self.lock and config.SOUSAKU_PROGRESS_PANEL and sys.stdout.isatty())
 
     def update(self, task_id, *, status, progress, images, elapsed):
-        if not self.enabled:
+        if not self.is_enabled():
             return False
         with self.lock:
             row = self.rows.setdefault(task_id, {"created_at": time.time()})
@@ -190,20 +229,20 @@ class SousakuProgressPanel:
         return True
 
     def finish(self, task_id):
-        if not self.enabled:
+        if not self.is_enabled():
             return
         with self.lock:
             self.rows.pop(task_id, None)
             self._render_locked()
 
     def before_log(self):
-        if not self.enabled:
+        if not self.is_enabled():
             return
         with self.lock:
             self._clear_locked()
 
     def after_log(self):
-        if not self.enabled:
+        if not self.is_enabled():
             return
         with self.lock:
             self._render_locked()
@@ -222,7 +261,7 @@ class SousakuProgressPanel:
         self.rows = {
             task_id: row
             for task_id, row in self.rows.items()
-            if now - row.get("created_at", now) < SOUSAKU_STALE_TASK_SECONDS
+            if now - row.get("created_at", now) < config.SOUSAKU_STALE_TASK_SECONDS
         }
         if not self.rows:
             return
@@ -254,7 +293,7 @@ _LOG_OUTPUT_LOCK = threading.RLock()
 
 def log_event(scope, message, level="INFO", icon=None, **fields):
     level = level.upper()
-    if LOG_LEVEL_ORDER.get(level, 20) < LOG_LEVEL_ORDER.get(LOG_LEVEL, 20):
+    if LOG_LEVEL_ORDER.get(level, 20) < LOG_LEVEL_ORDER.get(config.LOG_LEVEL, 20):
         return
 
     timestamp = time.strftime("%H:%M:%S")
@@ -277,7 +316,7 @@ def log_event(scope, message, level="INFO", icon=None, **fields):
         parts.append(f"{label}={_short(value)}")
     field_text = " ".join(parts)
 
-    if LOG_COLOR:
+    if _log_color_enabled():
         icon_color = LOG_COLORS.get(level, "")
         scope_color = SCOPE_COLORS.get(scope, LOG_COLORS.get(level, ""))
         provider_color = SCOPE_COLORS.get(provider_name, scope_color)
@@ -335,13 +374,13 @@ def _apply_sousaku_timeout_policy(task_id, result):
 
     state = _sousaku_log_state(task_id, now)
     elapsed_seconds = int(now - state["started_at"])
-    if elapsed_seconds < SOUSAKU_STALE_TASK_SECONDS:
+    if elapsed_seconds < config.SOUSAKU_STALE_TASK_SECONDS:
         return result
 
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     images = data.get("result", {}).get("images", [])
     progress = data.get("progress")
-    timeout_minutes = max(1, SOUSAKU_STALE_TASK_SECONDS // 60)
+    timeout_minutes = max(1, config.SOUSAKU_STALE_TASK_SECONDS // 60)
     return {
         "status": "failed",
         "error": {
@@ -386,7 +425,7 @@ def _log_sousaku_task_progress(task_id, result):
         )
         return
 
-    if elapsed_seconds >= SOUSAKU_STALE_TASK_SECONDS:
+    if elapsed_seconds >= config.SOUSAKU_STALE_TASK_SECONDS:
         if state.get("stale_logged"):
             return
         state["stale_logged"] = True
@@ -450,14 +489,17 @@ from routes.capabilities import capabilities_bp
 from routes.files import files_bp
 from routes.gallery import gallery_bp
 from routes.imports import imports_bp
+from routes.references import references_bp
 from routes.settings import settings_bp
 from services.sousaku_provider import create_task as create_sousaku_task, get_task as get_sousaku_task, refresh_account_records as refresh_sousaku_account_records
 from services.sousaku_provider import refresh_account_records_for_tokens as refresh_sousaku_account_records_for_tokens
+from services.sousaku.account_pool import ACCOUNT_POOL
 
 app.register_blueprint(capabilities_bp)
 app.register_blueprint(files_bp)
 app.register_blueprint(gallery_bp)
 app.register_blueprint(imports_bp)
+app.register_blueprint(references_bp)
 app.register_blueprint(settings_bp)
 
 _JOB_STORE = JobStore(JOBS_DB_PATH)
@@ -676,9 +718,19 @@ def generate_image():
             # Extract plain URL strings from objects
             urls = []
             for item in image_urls:
-                url = item.get("url", "") if isinstance(item, dict) else item
-                if url:
-                    urls.append(url)
+                if isinstance(item, dict):
+                    url = item.get("public_url") or item.get("url") or ""
+                else:
+                    url = item
+                if not url:
+                    continue
+                try:
+                    urls.append(ensure_public_url(item, provider="apimart"))
+                except Exception as exc:
+                    if str(url).startswith(("http://", "https://")):
+                        urls.append(str(url))
+                    else:
+                        raise RuntimeError(f"参考图公网上传失败，请重试或更换图床: {exc}") from exc
             if urls:
                 payload["image_urls"] = urls
         
@@ -1784,7 +1836,7 @@ def _job_provider_from_request(data):
 
 def _normalize_job_images(data):
     params = data.get("params") if isinstance(data.get("params"), dict) else {}
-    images = (
+    return normalize_reference_inputs(
         data.get("image_urls")
         or data.get("imageUrls")
         or data.get("input_images")
@@ -1795,14 +1847,6 @@ def _normalize_job_images(data):
         or params.get("inputImages")
         or []
     )
-    normalized = []
-    for item in images:
-        if isinstance(item, dict):
-            if item.get("url"):
-                normalized.append(dict(item))
-        elif item:
-            normalized.append({"url": str(item)})
-    return normalized
 
 
 @app.route('/api/jobs', methods=['POST'])
@@ -1870,7 +1914,7 @@ def delete_jobs():
 
 @app.route('/api/jobs/<job_id>', methods=['GET'])
 def get_job(job_id):
-    job = _JOB_STORE.get_job(job_id, include_events=True)
+    job = _JOB_STORE.get_job(job_id)
     if not job:
         return jsonify({"success": False, "error": {"message": "job not found"}}), 404
     return jsonify({"success": True, "data": job})
@@ -1934,14 +1978,21 @@ def list_provider_accounts():
                 or f"Sousaku #{index + 1}"
             )
             total_credit = account.get("total_credit")
-            running_count = int(account.get("running_task_count") or 0)
+            upstream_running_count = int(account.get("running_task_count") or 0)
             error = account.get("error")
             token = str(account.get("token") or "")
+            runtime_overlay = ACCOUNT_POOL.overlay_for_token(token) if token else {}
+            local_running_count = int(runtime_overlay.get("local_running_jobs") or 0)
+            running_count = upstream_running_count + local_running_count
             if token and token in disabled_tokens:
                 status = "disabled"
+            elif local_running_count > 0:
+                status = "busy"
+            elif runtime_overlay.get("cooldown_until"):
+                status = "invalid"
             elif error:
                 status = "invalid"
-            elif running_count > 0:
+            elif upstream_running_count > 0:
                 status = "busy"
             elif total_credit is not None and float(total_credit) <= low_credit_threshold:
                 status = "low_quota"
@@ -1971,6 +2022,11 @@ def list_provider_accounts():
                     "package_level": account.get("package_level"),
                     "token_masked": account.get("token_masked"),
                     "disabled": status == "disabled",
+                    "local_running_jobs": local_running_count,
+                    "local_job_ids": runtime_overlay.get("local_job_ids") or [],
+                    "upstream_running_jobs": upstream_running_count,
+                    "cooldown_until": runtime_overlay.get("cooldown_until"),
+                    "cooldown_error": runtime_overlay.get("cooldown_error"),
                     "subscription_credit": account.get("subscription_credit"),
                     "permanent_credit": account.get("permanent_credit"),
                 },
@@ -2497,40 +2553,23 @@ def upload_image():
             except Exception as e:
                 log_event("UPLOAD", "压缩失败，上传原图", "WARN", error=e)
         
-        # Upload to Telegraph Image
-        response = requests.post(
-            f"{TELEGRAPH_URL}/upload",
-            files={"file": (file_name, file_content, content_type)},
-            timeout=60  # Increased timeout for larger files
+        result = upload_public_image(
+            file_content,
+            file_name=file_name,
+            content_type=content_type,
+            timeout=60,
         )
-        log_event("UPLOAD", "图床返回", "OK" if response.status_code == 200 else "WARN", status=response.status_code, body=response.text[:200])
-        
-        # Telegraph returns JSON array: [{"src": "/file/xxx.png", ...}]
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0 and "src" in result[0]:
-                # Construct full URL
-                image_url = TELEGRAPH_URL + result[0]["src"]
-                return jsonify({
-                    "success": True,
-                    "url": image_url,
-                    "compressed": original_size > MAX_FILE_SIZE,
-                    "original_size": original_size,
-                    "final_size": len(file_content)
-                })
-            elif isinstance(result, list) and len(result) > 0 and "error" in result[0]:
-                return jsonify({
-                    "success": False,
-                    "message": result[0]["error"]
-                }), 400
-        
+        log_event("UPLOAD", "图床返回", "OK", url=result.url[:100], final=f"{result.size/1024/1024:.2f}MB")
         return jsonify({
-            "success": False, 
-            "message": "图床上传失败，请尝试使用Base64模式"
-        }), 400
+            "success": True,
+            "url": result.url,
+            "compressed": original_size > MAX_FILE_SIZE or result.compressed,
+            "original_size": original_size,
+            "final_size": result.size,
+        })
             
     except requests.exceptions.Timeout:
-        return jsonify({"success": False, "message": "上传超时，请尝试使用Base64模式"}), 408
+        return jsonify({"success": False, "message": "上传超时，请重新上传"}), 408
     except Exception as e:
         return jsonify({"success": False, "message": f"上传失败: {str(e)}"}), 500
 

@@ -5,7 +5,7 @@
  * Provider-specific payload translation lives in the backend Provider Adapters.
  */
 
-import type { GenerateParams, ImageItem, ThoughtImage } from '../types';
+import type { GenerateParams, ImageItem, ReferenceImageInput, ThoughtImage } from '../types';
 import {
     checkGenerationJob,
     createGenerationJob,
@@ -14,17 +14,18 @@ import {
 } from './api';
 
 export interface GenerationCallbacks {
-    onSuccess: (placeholderId: string, result: Partial<ImageItem>) => void;
+    onSuccess: (placeholderId: string, result: Partial<ImageItem>) => boolean | void;
     onError: (placeholderId: string, error: string) => void;
+    onReset?: (placeholderId: string) => void;
     onThoughtImages?: (images: ThoughtImage[]) => void;
 }
 
 export interface GenerationRequest {
     prompt: string;
-    apiType: 'apimart' | 'openai' | 'nanobanana2' | 'cliproxy' | 'sousaku' | 'other';
+    apiType: 'apimart' | 'openai' | 'nanobanana2' | 'cliproxy' | 'sousaku' | 'other' | string;
     params: GenerateParams;
     modelConfig?: RuntimeProvider['models'][number];
-    imageUrls?: { url: string }[];
+    imageUrls?: ReferenceImageInput[];
     placeholderIds: string[];
     maskDataUrl?: string;
     maskFeather?: number;
@@ -33,7 +34,7 @@ export interface GenerationRequest {
 type ProviderPayload = Record<string, unknown> & {
     prompt: string;
     n?: number;
-    image_urls?: { url: string }[];
+    image_urls?: ReferenceImageInput[];
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -86,11 +87,27 @@ function imageIdentity(image: Record<string, unknown>) {
     );
 }
 
+function imageAssignmentKey(image: Record<string, unknown>, placeholderId: string) {
+    const identity = imageIdentity(image);
+    const version = String(
+        image.saved_path ||
+        image.localPath ||
+        image.path ||
+        image.url ||
+        image.data_uri ||
+        image.b64_json ||
+        image.filename ||
+        ''
+    );
+    return identity ? `${identity}|${version}` : `slot:${placeholderId}|${version}`;
+}
+
 function toDisplayResult(image: Record<string, unknown>): Partial<ImageItem> {
     const localPath = image.saved_path as string | undefined;
     const directUrl = (image.url || image.data_uri || image.b64_json) as string | undefined;
     const serveUrl = localPath ? `/api/serve-image?path=${encodeURIComponent(localPath)}` : undefined;
     const displayUrl = serveUrl || directUrl || '';
+    const providerIndex = Number(image.index || image.resultIndex || 0);
 
     return {
         status: 'success',
@@ -101,26 +118,83 @@ function toDisplayResult(image: Record<string, unknown>): Partial<ImageItem> {
         height: image.height as number | undefined,
         originalUrl: directUrl,
         tags: image.download_failed ? ['下载失败'] : [],
+        providerIndex: Number.isFinite(providerIndex) && providerIndex > 0 ? providerIndex : undefined,
     };
+}
+
+function assignImageToPlaceholder(
+    assignments: Map<string, { key: string; identity: string; image: Record<string, unknown> }>,
+    usedIdentities: Set<string>,
+    image: Record<string, unknown>,
+    placeholderId: string | undefined,
+) {
+    if (!placeholderId || assignments.has(placeholderId)) return false;
+    const identity = imageIdentity(image);
+    if (identity && usedIdentities.has(identity)) return false;
+
+    assignments.set(placeholderId, {
+        key: imageAssignmentKey(image, placeholderId),
+        identity,
+        image,
+    });
+    if (identity) {
+        usedIdentities.add(identity);
+    }
+    return true;
 }
 
 function applyJobImages(
     job: GenerationJob,
     placeholderIds: string[],
-    filled: Set<string>,
-    seenImages: Set<string>,
+    assignedByPlaceholder: Map<string, string>,
+    assignedPlaceholderByIdentity: Map<string, string>,
+    deletedPlaceholderIds: Set<string>,
     callbacks: GenerationCallbacks,
 ) {
-    for (const image of job.result || []) {
+    const nextAssignments = new Map<string, { key: string; identity: string; image: Record<string, unknown> }>();
+    const usedIdentities = new Set<string>();
+    const images = job.result || [];
+
+    for (const image of images) {
         const identity = imageIdentity(image);
-        if (!identity || seenImages.has(identity)) continue;
+        const previousPlaceholder = identity ? assignedPlaceholderByIdentity.get(identity) : undefined;
+        if (!previousPlaceholder || deletedPlaceholderIds.has(previousPlaceholder)) {
+            continue;
+        }
+        assignImageToPlaceholder(nextAssignments, usedIdentities, image, previousPlaceholder);
+    }
 
-        const placeholderId = placeholderIds.find((id) => !filled.has(id));
-        if (!placeholderId) break;
+    for (const image of images) {
+        const identity = imageIdentity(image);
+        if (identity && usedIdentities.has(identity)) {
+            continue;
+        }
+        if (identity && assignedPlaceholderByIdentity.has(identity)) {
+            continue;
+        }
 
-        seenImages.add(identity);
-        filled.add(placeholderId);
-        callbacks.onSuccess(placeholderId, toDisplayResult(image));
+        const placeholderId = placeholderIds.find((id) => !deletedPlaceholderIds.has(id) && !nextAssignments.has(id));
+        if (!assignImageToPlaceholder(nextAssignments, usedIdentities, image, placeholderId)) {
+            break;
+        }
+    }
+
+    for (const [placeholderId, assignment] of nextAssignments) {
+        if (assignedByPlaceholder.get(placeholderId) !== assignment.key) {
+            const slotIndex = placeholderIds.indexOf(placeholderId) + 1;
+            const applied = callbacks.onSuccess(placeholderId, {
+                ...toDisplayResult(assignment.image),
+                resultIndex: slotIndex > 0 ? slotIndex : undefined,
+            });
+            if (applied === false) {
+                deletedPlaceholderIds.add(placeholderId);
+                continue;
+            }
+        }
+        assignedByPlaceholder.set(placeholderId, assignment.key);
+        if (assignment.identity) {
+            assignedPlaceholderByIdentity.set(assignment.identity, placeholderId);
+        }
     }
 }
 
@@ -136,8 +210,9 @@ async function runProviderJob(request: GenerationRequest, callbacks: GenerationC
         throw new Error(`${provider} 未返回 job_id`);
     }
 
-    const filled = new Set<string>();
-    const seenImages = new Set<string>();
+    const assignedByPlaceholder = new Map<string, string>();
+    const assignedPlaceholderByIdentity = new Map<string, string>();
+    const deletedPlaceholderIds = new Set<string>();
     const maxElapsedMs = 30 * 60 * 1000;
     const startedAt = Date.now();
 
@@ -149,12 +224,12 @@ async function runProviderJob(request: GenerationRequest, callbacks: GenerationC
             throw new Error(jobResponse.error?.message || `${provider} Job 查询失败`);
         }
 
-        applyJobImages(job, request.placeholderIds, filled, seenImages, callbacks);
+        applyJobImages(job, request.placeholderIds, assignedByPlaceholder, assignedPlaceholderByIdentity, deletedPlaceholderIds, callbacks);
 
         const status = String(job.status || '').toLowerCase();
         if (status === 'succeeded') {
             for (const placeholderId of request.placeholderIds) {
-                if (!filled.has(placeholderId)) {
+                if (!deletedPlaceholderIds.has(placeholderId) && !assignedByPlaceholder.has(placeholderId)) {
                     callbacks.onError(placeholderId, `${provider} 返回图片数量不足`);
                 }
             }
@@ -164,7 +239,7 @@ async function runProviderJob(request: GenerationRequest, callbacks: GenerationC
         if (['failed', 'error', 'timeout', 'cancelled'].includes(status)) {
             const message = job.error || `${provider} 生成失败`;
             for (const placeholderId of request.placeholderIds) {
-                if (!filled.has(placeholderId)) {
+                if (!deletedPlaceholderIds.has(placeholderId) && !assignedByPlaceholder.has(placeholderId)) {
                     callbacks.onError(placeholderId, message);
                 }
             }
@@ -173,7 +248,7 @@ async function runProviderJob(request: GenerationRequest, callbacks: GenerationC
     }
 
     for (const placeholderId of request.placeholderIds) {
-        if (!filled.has(placeholderId)) {
+        if (!deletedPlaceholderIds.has(placeholderId) && !assignedByPlaceholder.has(placeholderId)) {
             callbacks.onError(placeholderId, `${provider} 任务轮询超时`);
         }
     }
