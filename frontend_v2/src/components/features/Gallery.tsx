@@ -1,7 +1,15 @@
-import Masonry from 'react-masonry-css';
+import CssMasonry from 'react-masonry-css';
+import {
+    useContainerPosition,
+    useMasonry,
+    usePositioner,
+    useResizeObserver,
+    useScroller,
+} from 'masonic';
 import { useStore } from '../../store';
 import { useMemo, useCallback, useState, useRef, useEffect, memo } from 'react';
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
+import type { ComponentType, CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
+import type { RenderComponentProps } from 'masonic';
 import { motion } from 'framer-motion';
 import { Star, Trash2, Loader2 } from 'lucide-react';
 import { format } from 'date-fns';
@@ -20,10 +28,14 @@ import { providerBadgeClass, providerBadgeStyle, providerLabel } from '../../uti
 import { normalizePromptText } from '../../utils/prompt';
 
 const INITIAL_LOAD = 60;
-const LOAD_MORE = 30;
 const FALLBACK_SELECTION_COLOR = '#fdba74';
 const FALLBACK_SELECTION_BOX_COLOR = '#fef08a';
 const FALLBACK_TAG_COLOR = '#f43f5e';
+const VIRTUAL_MASONRY_COLUMN_WIDTH = 220;
+const VIRTUAL_MASONRY_GUTTER = 12;
+const VIRTUAL_MASONRY_ITEM_HEIGHT_ESTIMATE = 260;
+const VIRTUAL_MASONRY_OVERSCAN = 1.5;
+const VIRTUAL_MASONRY_SCROLL_FPS = 12;
 
 function normalizeSearchText(value: unknown) {
     return String(value || '')
@@ -120,6 +132,7 @@ function selectionBoxStyle(box: SelectionBox, color: string) {
 interface GalleryCardProps {
     image: ImageItem;
     isSelected: boolean;
+    layout?: 'css-masonry' | 'virtual-masonry';
     selectionColor: string;
     tagColor: string;
     providerName: string;
@@ -130,7 +143,7 @@ interface GalleryCardProps {
     registerCard: (id: string, node: HTMLDivElement | null) => void;
 }
 
-const GalleryCard = memo(function GalleryCard({ image, isSelected, selectionColor, tagColor, providerName, providerBadge, providerBadgeStyle, onSelect, onContextMenu, registerCard }: GalleryCardProps) {
+const GalleryCard = memo(function GalleryCard({ image, isSelected, layout = 'css-masonry', selectionColor, tagColor, providerName, providerBadge, providerBadgeStyle, onSelect, onContextMenu, registerCard }: GalleryCardProps) {
     const toggleFavorite = useStore((s) => s.toggleFavorite);
     const removeImage = useStore((s) => s.removeImage);
     const deleteLocalFile = useStore((s) => s.deleteLocalFile);
@@ -138,18 +151,22 @@ const GalleryCard = memo(function GalleryCard({ image, isSelected, selectionColo
     const imageFrameStyle: CSSProperties | undefined = hasImageSize
         ? { aspectRatio: `${image.width} / ${image.height}` }
         : undefined;
+    const cardClassName = layout === 'virtual-masonry'
+        ? 'group cursor-pointer'
+        : 'mb-3 group cursor-pointer';
+    const useEntryAnimation = layout !== 'virtual-masonry';
 
     return (
         <motion.div
             data-gallery-card="true"
             ref={(node) => registerCard(image.id, node)}
-            initial={{ opacity: 0, y: -15 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{
+            initial={useEntryAnimation ? { opacity: 0, y: -15 } : false}
+            animate={useEntryAnimation ? { opacity: 1, y: 0 } : undefined}
+            transition={useEntryAnimation ? {
                 duration: 0.35,
                 ease: 'easeOut',
-            }}
-            className="mb-3 group cursor-pointer"
+            } : undefined}
+            className={cardClassName}
             onClick={(event) => onSelect(image, event)}
             onContextMenu={(event) => onContextMenu(image, event)}
             onDragStart={(event) => event.preventDefault()}
@@ -370,6 +387,72 @@ function parseTagInput(value: string | null) {
     ));
 }
 
+function galleryLayoutSignature(images: ImageItem[]) {
+    let hash = 2166136261;
+    for (const image of images) {
+        for (let index = 0; index < image.id.length; index++) {
+            hash ^= image.id.charCodeAt(index);
+            hash = Math.imul(hash, 16777619);
+        }
+        hash ^= 124;
+        hash = Math.imul(hash, 16777619);
+    }
+    return `${images.length}:${hash >>> 0}`;
+}
+
+function useWindowSize() {
+    const getSize = () => ({
+        width: window.innerWidth || document.documentElement.clientWidth || 0,
+        height: window.innerHeight || document.documentElement.clientHeight || 0,
+    });
+    const [size, setSize] = useState(getSize);
+
+    useEffect(() => {
+        const handleResize = () => setSize(getSize());
+        window.addEventListener('resize', handleResize);
+        return () => window.removeEventListener('resize', handleResize);
+    }, []);
+
+    return size;
+}
+
+interface VirtualGalleryMasonryProps {
+    images: ImageItem[];
+    columns: number;
+    layoutSignature: string;
+    renderCard: ComponentType<RenderComponentProps<ImageItem>>;
+}
+
+function VirtualGalleryMasonry({ images, columns, layoutSignature, renderCard }: VirtualGalleryMasonryProps) {
+    const containerRef = useRef<HTMLElement | null>(null);
+    const windowSize = useWindowSize();
+    const containerPosition = useContainerPosition(containerRef, [windowSize.width, windowSize.height, columns]);
+    const positioner = usePositioner({
+        width: containerPosition.width || windowSize.width,
+        columnWidth: VIRTUAL_MASONRY_COLUMN_WIDTH,
+        columnGutter: VIRTUAL_MASONRY_GUTTER,
+        rowGutter: VIRTUAL_MASONRY_GUTTER,
+        maxColumnCount: columns,
+    }, [layoutSignature]);
+    const resizeObserver = useResizeObserver(positioner);
+    const { scrollTop, isScrolling } = useScroller(containerPosition.offset, VIRTUAL_MASONRY_SCROLL_FPS);
+
+    return useMasonry<ImageItem>({
+        positioner,
+        resizeObserver,
+        items: images,
+        render: renderCard,
+        itemKey: (image) => image.id,
+        itemHeightEstimate: VIRTUAL_MASONRY_ITEM_HEIGHT_ESTIMATE,
+        overscanBy: VIRTUAL_MASONRY_OVERSCAN,
+        height: windowSize.height,
+        scrollTop,
+        isScrolling,
+        containerRef,
+        tabIndex: -1,
+    });
+}
+
 // ─── Gallery Component ──────────────────────────────────────────
 export function Gallery() {
     const images = useStore((s) => s.images);
@@ -382,6 +465,7 @@ export function Gallery() {
     const clearSelectedImageIds = useStore((s) => s.clearSelectedImageIds);
     const toggleSelectedImageId = useStore((s) => s.toggleSelectedImageId);
     const removeImagesLocal = useStore((s) => s.removeImagesLocal);
+    const reloadGalleryFromServer = useStore((s) => s.reloadGalleryFromServer);
     const addTagsToImagesLocal = useStore((s) => s.addTagsToImagesLocal);
     const removeTagsFromImagesLocal = useStore((s) => s.removeTagsFromImagesLocal);
     const setImagesFavoriteLocal = useStore((s) => s.setImagesFavoriteLocal);
@@ -394,6 +478,7 @@ export function Gallery() {
     const gallerySelectionBoxColor = useStore((s) => s.gallerySelectionBoxColor);
     const galleryTagColor = useStore((s) => s.galleryTagColor);
     const { providers } = useProviders();
+    const selectedImageIdSet = useMemo(() => new Set(selectedImageIds), [selectedImageIds]);
 
     // Compute masonry breakpoints from gallery column setting
     const masonryBreakpoints = useMemo(() => ({
@@ -405,14 +490,11 @@ export function Gallery() {
         640: 1,
     }), [galleryColumns]);
 
-    // Infinite scroll state
-    const [visibleCount, setVisibleCount] = useState(INITIAL_LOAD);
     const [currentPage, setCurrentPage] = useState(1);
     const [pageInput, setPageInput] = useState('1');
     const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
     const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
     const [isBatchBusy, setIsBatchBusy] = useState(false);
-    const sentinelRef = useRef<HTMLDivElement>(null);
     const cardRefs = useRef(new Map<string, HTMLDivElement>());
     const selectionStartRef = useRef<{ x: number; y: number; additive: boolean } | null>(null);
     const isSelectingRef = useRef(false);
@@ -450,25 +532,22 @@ export function Gallery() {
             return true;
         });
     }, [images, filters]);
+    const virtualMasonrySignature = useMemo(
+        () => galleryLayoutSignature(filteredImages),
+        [filteredImages]
+    );
 
     const pageSize = Math.max(1, Math.floor(galleryPageSize || INITIAL_LOAD));
     const pageCount = Math.max(1, Math.ceil(filteredImages.length / pageSize));
     const safeCurrentPage = Math.min(currentPage, pageCount);
 
-    // Slice for infinite scroll or pagination
-    const visibleImages = useMemo(() => {
-        if (galleryDisplayMode === 'pagination') {
-            const start = (safeCurrentPage - 1) * pageSize;
-            return filteredImages.slice(start, start + pageSize);
-        }
-        return filteredImages.slice(0, visibleCount);
-    }, [filteredImages, galleryDisplayMode, pageSize, safeCurrentPage, visibleCount]);
+    const paginatedImages = useMemo(() => {
+        const start = (safeCurrentPage - 1) * pageSize;
+        return filteredImages.slice(start, start + pageSize);
+    }, [filteredImages, pageSize, safeCurrentPage]);
 
-    const hasMore = galleryDisplayMode === 'waterfall' && visibleCount < filteredImages.length;
-
-    // Reset visible count when filters change
+    // Reset pagination when filters or display mode change
     useEffect(() => {
-        setVisibleCount(INITIAL_LOAD);
         setCurrentPage(1);
     }, [filters, galleryDisplayMode, pageSize]);
 
@@ -490,25 +569,6 @@ export function Gallery() {
         setCurrentPage(nextPage);
         setPageInput(String(nextPage));
     }, [pageCount, pageInput, safeCurrentPage]);
-
-    // IntersectionObserver for infinite scroll
-    useEffect(() => {
-        if (galleryDisplayMode !== 'waterfall') return;
-        const sentinel = sentinelRef.current;
-        if (!sentinel || !hasMore) return;
-
-        const observer = new IntersectionObserver(
-            (entries) => {
-                if (entries[0].isIntersecting) {
-                    setVisibleCount((prev) => Math.min(prev + LOAD_MORE, filteredImages.length));
-                }
-            },
-            { rootMargin: '400px' }
-        );
-
-        observer.observe(sentinel);
-        return () => observer.disconnect();
-    }, [filteredImages.length, galleryDisplayMode, hasMore, visibleCount]);
 
     const registerCard = useCallback((id: string, node: HTMLDivElement | null) => {
         if (node) {
@@ -572,12 +632,9 @@ export function Gallery() {
                     currentY: event.clientY,
                 };
                 const rect = rectFromPoints(box);
-                const hitIds = visibleImages
-                    .filter((image) => {
-                        const node = cardRefs.current.get(image.id);
-                        return node ? intersectsRect(rect, node.getBoundingClientRect()) : false;
-                    })
-                    .map((image) => image.id);
+                const hitIds = Array.from(cardRefs.current.entries())
+                    .filter(([, node]) => intersectsRect(rect, node.getBoundingClientRect()))
+                    .map(([id]) => id);
 
                 if (hitIds.length > 0) {
                     const nextIds = start.additive
@@ -607,7 +664,7 @@ export function Gallery() {
             window.removeEventListener('mousemove', handleMouseMove);
             window.removeEventListener('mouseup', handleMouseUp);
         };
-    }, [clearSelectedImageIds, selectedImage, selectedImageIds, setSelectedImageIds, visibleImages]);
+    }, [clearSelectedImageIds, selectedImage, selectedImageIds, setSelectedImageIds]);
 
     useEffect(() => {
         const handleKeyDown = (event: KeyboardEvent) => {
@@ -643,6 +700,34 @@ export function Gallery() {
         setContextMenu({ x: event.clientX, y: event.clientY, ids: currentIds });
     }, [selectedImageIds, setSelectedImageIds]);
 
+    const renderGalleryCard = useCallback((image: ImageItem, layout: GalleryCardProps['layout'] = 'css-masonry') => (
+        <GalleryCard
+            image={image}
+            layout={layout}
+            isSelected={selectedImageIdSet.has(image.id)}
+            selectionColor={gallerySelectionColor}
+            tagColor={galleryTagColor}
+            providerName={providerLabel(image.apiType, providers)}
+            providerBadge={providerBadgeClass(image.apiType)}
+            providerBadgeStyle={providerBadgeStyle(image.apiType, providers)}
+            onSelect={handleSelect}
+            onContextMenu={handleCardContextMenu}
+            registerCard={registerCard}
+        />
+    ), [
+        gallerySelectionColor,
+        galleryTagColor,
+        handleCardContextMenu,
+        handleSelect,
+        providers,
+        registerCard,
+        selectedImageIdSet,
+    ]);
+
+    const renderVirtualGalleryCard = useCallback(({ data: image }: RenderComponentProps<ImageItem>) => (
+        renderGalleryCard(image, 'virtual-masonry')
+    ), [renderGalleryCard]);
+
     const contextIds = contextMenu?.ids ?? [];
     const allContextFavorites = contextIds.length > 0 && contextIds.every((id) => {
         const image = images.find((item) => item.id === id);
@@ -665,13 +750,31 @@ export function Gallery() {
 
     const handleBatchDelete = useCallback(() => {
         const ids = contextMenu?.ids ?? [];
-        if (!ids.length) return;
-        void runBatchAction(async () => {
-            await batchDeleteGalleryImages(ids, deleteLocalFile);
-            removeImagesLocal(ids);
-            clearSelectedImageIds();
-        });
-    }, [clearSelectedImageIds, contextMenu, deleteLocalFile, removeImagesLocal, runBatchAction]);
+        if (!ids.length || isBatchBusy) return;
+        const deleteIds = [...ids];
+
+        setIsBatchBusy(true);
+        setContextMenu(null);
+        removeImagesLocal(deleteIds);
+        clearSelectedImageIds();
+
+        void batchDeleteGalleryImages(deleteIds, deleteLocalFile)
+            .catch((error) => {
+                const message = error instanceof Error ? error.message : String(error);
+                void reloadGalleryFromServer();
+                window.alert(message || '删除失败，已重新加载图廊。');
+            })
+            .finally(() => {
+                setIsBatchBusy(false);
+            });
+    }, [
+        clearSelectedImageIds,
+        contextMenu,
+        deleteLocalFile,
+        isBatchBusy,
+        reloadGalleryFromServer,
+        removeImagesLocal,
+    ]);
 
     const handleReusePrompt = useCallback(() => {
         const ids = contextMenu?.ids ?? [];
@@ -764,35 +867,25 @@ export function Gallery() {
             <div
                 className="relative flex-1 select-none px-4 pt-6 pb-36 md:pb-40 overflow-x-hidden"
             >
-                <Masonry
-                    breakpointCols={masonryBreakpoints}
-                    className="flex -ml-3"
-                    columnClassName="pl-3"
-                >
-                    {visibleImages.map((image) => (
-                        <GalleryCard
-                            key={image.id}
-                            image={image}
-                            isSelected={selectedImageIds.includes(image.id)}
-                            selectionColor={gallerySelectionColor}
-                            tagColor={galleryTagColor}
-                            providerName={providerLabel(image.apiType, providers)}
-                            providerBadge={providerBadgeClass(image.apiType)}
-                            providerBadgeStyle={providerBadgeStyle(image.apiType, providers)}
-                            onSelect={handleSelect}
-                            onContextMenu={handleCardContextMenu}
-                            registerCard={registerCard}
-                        />
-                    ))}
-                </Masonry>
-
-                {/* Infinite scroll sentinel */}
-                {hasMore && (
-                    <div
-                        ref={sentinelRef}
-                        aria-hidden="true"
-                        className="h-10"
+                {galleryDisplayMode === 'waterfall' ? (
+                    <VirtualGalleryMasonry
+                        images={filteredImages}
+                        columns={galleryColumns}
+                        layoutSignature={virtualMasonrySignature}
+                        renderCard={renderVirtualGalleryCard}
                     />
+                ) : (
+                    <CssMasonry
+                        breakpointCols={masonryBreakpoints}
+                        className="flex -ml-3"
+                        columnClassName="pl-3"
+                    >
+                        {paginatedImages.map((image) => (
+                            <div key={image.id}>
+                                {renderGalleryCard(image)}
+                            </div>
+                        ))}
+                    </CssMasonry>
                 )}
 
                 {galleryDisplayMode === 'pagination' && filteredImages.length > pageSize && (
@@ -834,12 +927,6 @@ export function Gallery() {
                     </div>
                 )}
 
-                {/* End of gallery indicator */}
-                {galleryDisplayMode === 'waterfall' && !hasMore && filteredImages.length > INITIAL_LOAD && (
-                    <div className="text-center py-6 text-[var(--text-muted)] text-sm">
-                        已显示全部 {filteredImages.length} 张图片
-                    </div>
-                )}
             </div>
 
             {selectionBox && (

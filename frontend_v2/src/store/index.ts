@@ -61,6 +61,31 @@ function deriveTags(images: ImageItem[]): string[] {
     return Array.from(tags).sort();
 }
 
+function deriveTagsAfterDelete(previousTags: string[], remainingImages: ImageItem[], deletedImages: ImageItem[]) {
+    const touchedTags = new Set<string>();
+    deletedImages.forEach((image) => {
+        image.tags.forEach((tag) => {
+            const cleaned = tag.trim();
+            if (cleaned) touchedTags.add(cleaned);
+        });
+    });
+    if (touchedTags.size === 0) {
+        return previousTags;
+    }
+
+    const stillUsedTags = new Set<string>();
+    remainingImages.forEach((image) => {
+        image.tags.forEach((tag) => {
+            const cleaned = tag.trim();
+            if (touchedTags.has(cleaned)) {
+                stillUsedTags.add(cleaned);
+            }
+        });
+    });
+
+    return previousTags.filter((tag) => !touchedTags.has(tag) || stillUsedTags.has(tag));
+}
+
 function mergeTags(existing: string[], images: ImageItem[]): string[] {
     const tags = new Set(existing);
     let changed = false;
@@ -420,8 +445,9 @@ export const useStore = create<AppState>()(
 
             removeImagesLocal: (ids) => set((state) => {
                 const idSet = new Set(ids);
+                const deletedImages = state.images.filter((image) => idSet.has(image.id));
                 const images = state.images.filter((image) => !idSet.has(image.id));
-                const allTags = deriveTags(images);
+                const allTags = deriveTagsAfterDelete(state.allTags, images, deletedImages);
                 return {
                     images,
                     allTags,
@@ -513,8 +539,9 @@ export const useStore = create<AppState>()(
 
                 console.log(`🗑️ removeImage called for ${id}, wasSaved=${wasSaved}, deleteLocal=${shouldDeleteLocal}`);
                 set((state) => {
+                    const deletedImages = state.images.filter((img) => img.id === id);
                     const images = state.images.filter((img) => img.id !== id);
-                    const allTags = deriveTags(images);
+                    const allTags = deriveTagsAfterDelete(state.allTags, images, deletedImages);
                     return {
                         images,
                         allTags,
@@ -534,8 +561,9 @@ export const useStore = create<AppState>()(
 
             removeImageLocalOnly: (id) => {
                 set((state) => {
+                    const deletedImages = state.images.filter((img) => img.id === id);
                     const images = state.images.filter((img) => img.id !== id);
-                    const allTags = deriveTags(images);
+                    const allTags = deriveTagsAfterDelete(state.allTags, images, deletedImages);
                     return {
                         images,
                         allTags,
