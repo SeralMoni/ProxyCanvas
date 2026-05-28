@@ -1,15 +1,9 @@
 import CssMasonry from 'react-masonry-css';
-import {
-    useContainerPosition,
-    useMasonry,
-    usePositioner,
-    useResizeObserver,
-    useScroller,
-} from 'masonic';
+import { VirtuosoMasonry } from '@virtuoso.dev/masonry';
 import { useStore } from '../../store';
 import { useMemo, useCallback, useState, useRef, useEffect, memo } from 'react';
-import type { ComponentType, CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
-import type { RenderComponentProps } from 'masonic';
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
+import type { ItemContent } from '@virtuoso.dev/masonry';
 import { motion } from 'framer-motion';
 import { Star, Trash2, Loader2 } from 'lucide-react';
 import { format } from 'date-fns';
@@ -31,11 +25,7 @@ const INITIAL_LOAD = 60;
 const FALLBACK_SELECTION_COLOR = '#fdba74';
 const FALLBACK_SELECTION_BOX_COLOR = '#fef08a';
 const FALLBACK_TAG_COLOR = '#f43f5e';
-const VIRTUAL_MASONRY_COLUMN_WIDTH = 220;
-const VIRTUAL_MASONRY_GUTTER = 12;
-const VIRTUAL_MASONRY_ITEM_HEIGHT_ESTIMATE = 260;
-const VIRTUAL_MASONRY_OVERSCAN = 1.5;
-const VIRTUAL_MASONRY_SCROLL_FPS = 12;
+const VIRTUAL_MASONRY_INITIAL_ITEMS = 60;
 
 function normalizeSearchText(value: unknown) {
     return String(value || '')
@@ -131,7 +121,6 @@ function selectionBoxStyle(box: SelectionBox, color: string) {
 
 interface GalleryCardProps {
     image: ImageItem;
-    isSelected: boolean;
     layout?: 'css-masonry' | 'virtual-masonry';
     selectionColor: string;
     tagColor: string;
@@ -143,10 +132,11 @@ interface GalleryCardProps {
     registerCard: (id: string, node: HTMLDivElement | null) => void;
 }
 
-const GalleryCard = memo(function GalleryCard({ image, isSelected, layout = 'css-masonry', selectionColor, tagColor, providerName, providerBadge, providerBadgeStyle, onSelect, onContextMenu, registerCard }: GalleryCardProps) {
+const GalleryCard = memo(function GalleryCard({ image, layout = 'css-masonry', selectionColor, tagColor, providerName, providerBadge, providerBadgeStyle, onSelect, onContextMenu, registerCard }: GalleryCardProps) {
     const toggleFavorite = useStore((s) => s.toggleFavorite);
     const removeImage = useStore((s) => s.removeImage);
     const deleteLocalFile = useStore((s) => s.deleteLocalFile);
+    const isSelected = useStore((s) => s.selectedImageIds.includes(image.id));
     const hasImageSize = Boolean(image.width && image.height && image.width > 0 && image.height > 0);
     const imageFrameStyle: CSSProperties | undefined = hasImageSize
         ? { aspectRatio: `${image.width} / ${image.height}` }
@@ -387,70 +377,28 @@ function parseTagInput(value: string | null) {
     ));
 }
 
-function galleryLayoutSignature(images: ImageItem[]) {
-    let hash = 2166136261;
-    for (const image of images) {
-        for (let index = 0; index < image.id.length; index++) {
-            hash ^= image.id.charCodeAt(index);
-            hash = Math.imul(hash, 16777619);
-        }
-        hash ^= 124;
-        hash = Math.imul(hash, 16777619);
-    }
-    return `${images.length}:${hash >>> 0}`;
-}
-
-function useWindowSize() {
-    const getSize = () => ({
-        width: window.innerWidth || document.documentElement.clientWidth || 0,
-        height: window.innerHeight || document.documentElement.clientHeight || 0,
-    });
-    const [size, setSize] = useState(getSize);
-
-    useEffect(() => {
-        const handleResize = () => setSize(getSize());
-        window.addEventListener('resize', handleResize);
-        return () => window.removeEventListener('resize', handleResize);
-    }, []);
-
-    return size;
-}
-
 interface VirtualGalleryMasonryProps {
     images: ImageItem[];
     columns: number;
-    layoutSignature: string;
-    renderCard: ComponentType<RenderComponentProps<ImageItem>>;
+    renderCard: ItemContent<ImageItem>;
 }
 
-function VirtualGalleryMasonry({ images, columns, layoutSignature, renderCard }: VirtualGalleryMasonryProps) {
-    const containerRef = useRef<HTMLElement | null>(null);
-    const windowSize = useWindowSize();
-    const containerPosition = useContainerPosition(containerRef, [windowSize.width, windowSize.height, columns]);
-    const positioner = usePositioner({
-        width: containerPosition.width || windowSize.width,
-        columnWidth: VIRTUAL_MASONRY_COLUMN_WIDTH,
-        columnGutter: VIRTUAL_MASONRY_GUTTER,
-        rowGutter: VIRTUAL_MASONRY_GUTTER,
-        maxColumnCount: columns,
-    }, [layoutSignature]);
-    const resizeObserver = useResizeObserver(positioner);
-    const { scrollTop, isScrolling } = useScroller(containerPosition.offset, VIRTUAL_MASONRY_SCROLL_FPS);
+interface VirtuosoGalleryItemProps {
+    data: ImageItem;
+    index: number;
+    context: unknown;
+}
 
-    return useMasonry<ImageItem>({
-        positioner,
-        resizeObserver,
-        items: images,
-        render: renderCard,
-        itemKey: (image) => image.id,
-        itemHeightEstimate: VIRTUAL_MASONRY_ITEM_HEIGHT_ESTIMATE,
-        overscanBy: VIRTUAL_MASONRY_OVERSCAN,
-        height: windowSize.height,
-        scrollTop,
-        isScrolling,
-        containerRef,
-        tabIndex: -1,
-    });
+function VirtualGalleryMasonry({ images, columns, renderCard }: VirtualGalleryMasonryProps) {
+    return (
+        <VirtuosoMasonry<ImageItem, unknown>
+            data={images}
+            columnCount={columns}
+            useWindowScroll
+            initialItemCount={Math.min(VIRTUAL_MASONRY_INITIAL_ITEMS, images.length)}
+            ItemContent={renderCard}
+        />
+    );
 }
 
 // ─── Gallery Component ──────────────────────────────────────────
@@ -478,7 +426,6 @@ export function Gallery() {
     const gallerySelectionBoxColor = useStore((s) => s.gallerySelectionBoxColor);
     const galleryTagColor = useStore((s) => s.galleryTagColor);
     const { providers } = useProviders();
-    const selectedImageIdSet = useMemo(() => new Set(selectedImageIds), [selectedImageIds]);
 
     // Compute masonry breakpoints from gallery column setting
     const masonryBreakpoints = useMemo(() => ({
@@ -532,11 +479,17 @@ export function Gallery() {
             return true;
         });
     }, [images, filters]);
-    const virtualMasonrySignature = useMemo(
-        () => galleryLayoutSignature(filteredImages),
-        [filteredImages]
-    );
-
+    const virtualMasonryKey = useMemo(() => {
+        const selectedDate = filters.selectedDate
+            ? format(filters.selectedDate, 'yyyy-MM-dd')
+            : '';
+        return [
+            normalizeSearchText(filters.searchQuery),
+            selectedDate,
+            filters.selectedTags.join('\u001f'),
+            filters.showFavoritesOnly ? 'favorites' : 'all',
+        ].join('\u001e');
+    }, [filters.searchQuery, filters.selectedDate, filters.selectedTags, filters.showFavoritesOnly]);
     const pageSize = Math.max(1, Math.floor(galleryPageSize || INITIAL_LOAD));
     const pageCount = Math.max(1, Math.ceil(filteredImages.length / pageSize));
     const safeCurrentPage = Math.min(currentPage, pageCount);
@@ -550,6 +503,11 @@ export function Gallery() {
     useEffect(() => {
         setCurrentPage(1);
     }, [filters, galleryDisplayMode, pageSize]);
+
+    useEffect(() => {
+        clearSelectedImageIds();
+        setContextMenu(null);
+    }, [clearSelectedImageIds, virtualMasonryKey]);
 
     useEffect(() => {
         if (currentPage > pageCount) {
@@ -592,7 +550,11 @@ export function Gallery() {
         };
 
         const handleMouseDown = (event: MouseEvent) => {
-            if (selectedImage || event.button !== 0 || isInteractiveTarget(event.target)) return;
+            if (
+                selectedImage ||
+                event.button !== 0 ||
+                isInteractiveTarget(event.target)
+            ) return;
             event.preventDefault();
             selectionStartRef.current = {
                 x: event.clientX,
@@ -693,18 +655,18 @@ export function Gallery() {
 
     const handleCardContextMenu = useCallback((image: ImageItem, event: ReactMouseEvent) => {
         event.preventDefault();
-        const currentIds = selectedImageIds.includes(image.id) ? selectedImageIds : [image.id];
-        if (!selectedImageIds.includes(image.id)) {
+        const latestSelectedImageIds = useStore.getState().selectedImageIds;
+        const currentIds = latestSelectedImageIds.includes(image.id) ? latestSelectedImageIds : [image.id];
+        if (!latestSelectedImageIds.includes(image.id)) {
             setSelectedImageIds([image.id]);
         }
         setContextMenu({ x: event.clientX, y: event.clientY, ids: currentIds });
-    }, [selectedImageIds, setSelectedImageIds]);
+    }, [setSelectedImageIds]);
 
     const renderGalleryCard = useCallback((image: ImageItem, layout: GalleryCardProps['layout'] = 'css-masonry') => (
         <GalleryCard
             image={image}
             layout={layout}
-            isSelected={selectedImageIdSet.has(image.id)}
             selectionColor={gallerySelectionColor}
             tagColor={galleryTagColor}
             providerName={providerLabel(image.apiType, providers)}
@@ -721,11 +683,12 @@ export function Gallery() {
         handleSelect,
         providers,
         registerCard,
-        selectedImageIdSet,
     ]);
 
-    const renderVirtualGalleryCard = useCallback(({ data: image }: RenderComponentProps<ImageItem>) => (
-        renderGalleryCard(image, 'virtual-masonry')
+    const renderVirtualGalleryCard = useCallback(({ data: image }: VirtuosoGalleryItemProps) => (
+        <div className="px-1.5 pb-3">
+            {renderGalleryCard(image, 'virtual-masonry')}
+        </div>
     ), [renderGalleryCard]);
 
     const contextIds = contextMenu?.ids ?? [];
@@ -869,9 +832,9 @@ export function Gallery() {
             >
                 {galleryDisplayMode === 'waterfall' ? (
                     <VirtualGalleryMasonry
+                        key={virtualMasonryKey}
                         images={filteredImages}
                         columns={galleryColumns}
-                        layoutSignature={virtualMasonrySignature}
                         renderCard={renderVirtualGalleryCard}
                     />
                 ) : (

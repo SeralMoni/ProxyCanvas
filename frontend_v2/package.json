@@ -12,12 +12,12 @@
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-popover": "^1.1.15",
+    "@virtuoso.dev/masonry": "^1.4.3",
     "axios": "^1.13.4",
     "date-fns": "^4.1.0",
     "framer-motion": "^12.29.2",
     "konva": "^10.3.0",
     "lucide-react": "^0.563.0",
-    "masonic": "^4.1.0",
     "react": "^19.2.0",
     "react-colorful": "^5.7.0",
     "react-dom": "^19.2.0",

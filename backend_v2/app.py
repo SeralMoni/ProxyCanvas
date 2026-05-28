@@ -47,6 +47,9 @@ QUIET_ACCESS_PATHS = (
 )
 QUIET_ACCESS_METHODS = {"GET", "OPTIONS"}
 QUIET_ACCESS_STATUS = {200, 204, 304}
+QUIET_ACCESS_METHOD_STATUS = {
+    ("POST", "/api/jobs", 202),
+}
 
 
 def _is_quiet_access_path(path: str) -> bool:
@@ -56,15 +59,18 @@ def _is_quiet_access_path(path: str) -> bool:
 class QuietAccessLogs(logging.Filter):
     def filter(self, record):
         message = record.getMessage()
-        if not any(status in message for status in (" 200 ", " 204 ", " 304 ")):
-            return True
-        if not any(method in message for method in ('"GET ', '"OPTIONS ')):
-            return True
-        match = re.search(r'"(?:GET|OPTIONS)\s+([^"]+?)\s+HTTP/', message)
+        match = re.search(r'"([A-Z]+)\s+([^"]+?)\s+HTTP/', message)
         if not match:
             return True
-        path = urlsplit(match.group(1)).path
-        return not _is_quiet_access_path(path)
+        method = match.group(1)
+        path = urlsplit(match.group(2)).path
+        status_match = re.search(r'"\s+(\d{3})\s+', message)
+        status = int(status_match.group(1)) if status_match else None
+        if (method, path, status) in QUIET_ACCESS_METHOD_STATUS:
+            return False
+        if method in QUIET_ACCESS_METHODS and status in QUIET_ACCESS_STATUS and _is_quiet_access_path(path):
+            return False
+        return True
 
 
 _original_log_request = WSGIRequestHandler.log_request
@@ -75,6 +81,8 @@ def _quiet_log_request(self, code="-", size="-"):
         method, target, *_ = self.requestline.split()
         status = int(code)
         path = urlsplit(target).path
+        if (method, path, status) in QUIET_ACCESS_METHOD_STATUS:
+            return
         if method in QUIET_ACCESS_METHODS and status in QUIET_ACCESS_STATUS and _is_quiet_access_path(path):
             return
     except Exception:

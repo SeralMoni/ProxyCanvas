@@ -400,7 +400,6 @@ export const useStore = create<AppState>()(
             },
 
             reloadGalleryFromServer: async () => {
-                set({ galleryLoaded: false });
                 try {
                     const data = await loadGallery();
                     const sorted = sortGalleryImages(data.images);
